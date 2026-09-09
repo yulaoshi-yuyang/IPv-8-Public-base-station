@@ -111,7 +111,7 @@ pub enum FrameError {
     BadHandshakeLen,
     /// 帧内密码套件与本端配置不符（部署漂移诊断；ADR-025）
     SuiteMismatch { expected: CipherSuite, got: CipherSuite },
-    /// 帧的 epoch 不属于本分片 SA（epoch ≢ shard mod stride；ADR-026 流级分片）
+    /// 帧的 epoch 不属于本分片 SA（epoch ≢ shard mod stride；ADR-024 用户态性能线：流级分片）
     ShardMismatch { epoch: u64, shard: u64, stride: u64 },
     /// 认证握手失败（伪造证书/过期/transcript 签名无效）
     AuthFailed,

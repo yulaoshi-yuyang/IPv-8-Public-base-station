@@ -40,6 +40,17 @@ check("ANS_lease_seconds_clamped", AnsLeaseSecondsClamped);
 check("ANS_plan_expiry_and_lease_release", AnsPlanExpiryAndLeaseRelease);
 check("NRPT_stop_without_script_is_noop", NrptStopWithoutScriptIsNoop);
 check("Events_fallback_fields_roundtrip", EventsFallbackFieldsRoundtrip);
+check("NRPT_relative_path_resolves_against_base_directory", NrptRelativePathResolvesAgainstBaseDirectory);
+check("NRPT_stop_with_real_script_is_invoked", NrptStopWithRealScriptIsInvoked);
+check("QoS_concurrent_enqueue_count_conserved", QoSConcurrentEnqueueCountConserved);
+check("QoS_dropped_count_monotonic_under_pressure", QoSDroppedCountMonotonicUnderPressure);
+check("QoS_concurrent_dequeue_no_loss_no_duplicate", QoSConcurrentDequeueNoLossNoDuplicate);
+check("ANS_same_name_different_addr_coexist", AnsSameNameDifferentAddrCoexist);
+check("ANS_capability_multi_tag_intersection_sorted", AnsCapabilityMultiTagIntersectionSorted);
+check("TunnelProto_stream_in_out_shapes", TunnelProtoStreamInOutShapes);
+check("TunnelProto_fallback_and_status_fields", TunnelProtoFallbackAndStatusFields);
+check("MockTun_lifecycle_start_stop_read_write", MockTunLifecycleStartStopReadWrite);
+check("Events_all_subtypes_timestamp_overwrite_complete", EventsAllSubtypesTimestampOverwriteComplete);
 
 Console.WriteLine(failures.Count == 0 ? "全部通过" : $"{failures.Count} 个失败");
 return failures.Count;
@@ -568,4 +579,258 @@ static void EventsFallbackFieldsRoundtrip()
     if (e.Reason != "plain udp") throw new Exception("reason");
     var established = new TunnelEstablishedEvent(e.PeerAddrText, 42);
     if (established.InitialEpoch != 42) throw new Exception("epoch");
+}
+
+// —————— 集成测试（2026-09-09）：真实脚本执行 / 并发契约 / proto 冻结面 ——————
+
+// PS 5.1 按 ANSI 解码无 BOM 脚本 → 脚本内容里的中文路径会乱码。
+// 带 BOM 的 UTF-8 让 powershell.exe 正确解码（本仓库路径含非 ASCII 是常态）。
+static void WriteScript(string path, string body)
+    => File.WriteAllText(path, body, new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+
+static void NrptStopWithRealScriptIsInvoked()
+{
+    // 绝对路径分支：StopAsync 必须真正拉起 powershell 执行脚本（同步等待退出）。
+    var dir = Path.Combine(Path.GetTempPath(), $"ipv8-nrpt-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(dir);
+    try
+    {
+        var script = Path.Combine(dir, "cleanup-marker.ps1");
+        var marker = Path.Combine(dir, "marker.txt");
+        WriteScript(script, $"Set-Content -LiteralPath '{marker}' -Value 'ran'");
+        var opts = Options.Create(new ClientOptions { NrptCleanupScriptPath = script });
+        var svc = new NrptCleanupService(NullLogger<NrptCleanupService>.Instance, opts);
+        svc.StopAsync(CancellationToken.None).GetAwaiter().GetResult();
+        if (!File.Exists(marker)) throw new Exception("脚本未被执行（marker 缺失）");
+        if (File.ReadAllText(marker).Trim() != "ran") throw new Exception("marker 内容异常");
+    }
+    finally
+    {
+        try { Directory.Delete(dir, true); } catch { /* 临时目录清理失败不影响判定 */ }
+    }
+}
+
+static void NrptRelativePathResolvesAgainstBaseDirectory()
+{
+    // 相对路径分支：以 AppContext.BaseDirectory 为基准（发布根语义）。
+    var relDir = Path.Combine("nrpt-rel-test", Guid.NewGuid().ToString("N"));
+    var absDir = Path.Combine(AppContext.BaseDirectory, relDir);
+    Directory.CreateDirectory(absDir);
+    try
+    {
+        var script = Path.Combine(absDir, "cleanup-marker.ps1");
+        var marker = Path.Combine(absDir, "marker.txt");
+        WriteScript(script, $"Set-Content -LiteralPath '{marker}' -Value 'ran'");
+        var opts = Options.Create(new ClientOptions
+        {
+            NrptCleanupScriptPath = Path.Combine(relDir, "cleanup-marker.ps1"),
+        });
+        var svc = new NrptCleanupService(NullLogger<NrptCleanupService>.Instance, opts);
+        svc.StopAsync(CancellationToken.None).GetAwaiter().GetResult();
+        if (!File.Exists(marker)) throw new Exception("相对路径未按 BaseDirectory 解析执行");
+    }
+    finally
+    {
+        try { Directory.Delete(absDir, true); } catch { /* 同上 */ }
+    }
+}
+
+static void QoSConcurrentEnqueueCountConserved()
+{
+    // 多线程入队：成功数 + 丢弃数 == 尝试数，且成功数恰等于类容量（锁内原子的契约）。
+    var qos = new QoSManagerService(Options.Create(new ClientOptions { QoSClassCapacity = 1000 }));
+    const int threads = 8, per = 200; // 1600 次尝试 vs 容量 1000
+    var ok = 0;
+    Parallel.For(0, threads, t =>
+    {
+        for (var i = 0; i < per; i++)
+        {
+            if (qos.TryEnqueue(0, new byte[] { (byte)t, (byte)i }))
+            {
+                Interlocked.Increment(ref ok);
+            }
+        }
+    });
+    if (ok != 1000) throw new Exception($"成功入队应恰为容量 1000，实得 {ok}");
+    if (qos.Backlog != ok) throw new Exception($"Backlog {qos.Backlog} != 成功入队 {ok}");
+    if (qos.DroppedCount != threads * per - ok) throw new Exception("dropped + success != attempts，计数不守恒");
+}
+
+static void QoSDroppedCountMonotonicUnderPressure()
+{
+    // 观测契约：丢弃计数单调不减（gRPC TunnelStatus / 健康检查依赖此语义）。
+    var qos = new QoSManagerService(Options.Create(new ClientOptions { QoSClassCapacity = 64 }));
+    long prev = -1;
+    var regressed = false;
+    Parallel.For(0, 4, t =>
+    {
+        for (var i = 0; i < 500; i++)
+        {
+            qos.TryEnqueue(t, new byte[] { (byte)i });
+            if (i % 50 == 0)
+            {
+                var d = Interlocked.Read(ref prev);
+                var now = qos.DroppedCount;
+                if (now < d) regressed = true;
+                while (Interlocked.CompareExchange(ref prev, Math.Max(d, now), d) != d)
+                {
+                    d = Interlocked.Read(ref prev);
+                }
+            }
+        }
+    });
+    if (regressed) throw new Exception("DroppedCount 出现倒退（非单调）");
+    if (qos.DroppedCount <= 0) throw new Exception("压满后应有丢弃计数");
+}
+
+static void QoSConcurrentDequeueNoLossNoDuplicate()
+{
+    // 多线程出队：每帧恰好出队一次（无重无失），排空后 Backlog 归零。
+    var qos = new QoSManagerService(Options.Create(new ClientOptions { QoSClassCapacity = 4096 }));
+    const int total = 2000;
+    for (var i = 0; i < total; i++)
+    {
+        if (!qos.TryEnqueue(i % 4, BitConverter.GetBytes(i)))
+        {
+            throw new Exception($"入队 {i} 失败（容量应足够）");
+        }
+    }
+    var got = new System.Collections.Concurrent.ConcurrentBag<int>();
+    Parallel.For(0, 8, _ =>
+    {
+        while (qos.DequeueNext() is { } frame)
+        {
+            got.Add(BitConverter.ToInt32(frame));
+        }
+    });
+    if (got.Count != total) throw new Exception($"出队 {got.Count} != {total}");
+    if (got.Distinct().Count() != total) throw new Exception("存在重复出队帧");
+    if (qos.Backlog != 0) throw new Exception("应全部排空");
+}
+
+static void AnsSameNameDifferentAddrCoexist()
+{
+    // addr 是主键；同名不同 addr 两条都必须在发现视图可见（防镜像静默丢条目）。
+    var mesh = new AgentMeshService();
+    mesh.Upsert(new CapabilityAgent("dup.name", "addr-1.ipv8", "", ["ocr"], [], 5, 4_000_000_000));
+    mesh.Upsert(new CapabilityAgent("dup.name", "addr-2.ipv8", "", ["ocr"], [], 5, 4_000_000_001));
+    if (mesh.Count != 2) throw new Exception($"总数 {mesh.Count}，应为 2");
+    var hits = mesh.Capability(["ocr"], 0, true, 1_000);
+    if (hits.Count != 2) throw new Exception($"同名两条应都可见，实得 {hits.Count}");
+    var addrs = hits.Select(h => h.AddrText).OrderBy(x => x, StringComparer.Ordinal).ToList();
+    if (addrs[0] != "addr-1.ipv8" || addrs[1] != "addr-2.ipv8") throw new Exception("addr 集合异常");
+    // 名字索引命中两条中的某一条（主键是 addr，名字归属不作强约定）
+    if (mesh.ResolveName("dup.name") is not { Name: "dup.name" }) throw new Exception("名字解析应命中其一");
+}
+
+static void AnsCapabilityMultiTagIntersectionSorted()
+{
+    // 多标签交集（required ⊆ caps）+ 三级排序 (qos 降, not_after 降, addr 升)。
+    var mesh = new AgentMeshService();
+    mesh.Upsert(new CapabilityAgent("hi", "addr-hi", "", ["ocr", "asr"], [], 9, 4_000_000_000));
+    mesh.Upsert(new CapabilityAgent("hi2", "addr-hi2", "", ["ocr", "asr", "tts"], [], 9, 3_000_000_000)); // 同 qos、低 TTL
+    mesh.Upsert(new CapabilityAgent("mid", "addr-mid", "", ["ocr", "asr"], [], 5, 4_000_000_000));
+    mesh.Upsert(new CapabilityAgent("partial", "addr-p", "", ["ocr"], [], 15, 4_000_000_000)); // 缺 asr 不得命中
+    ExpectSeq(
+        mesh.Capability(["ocr", "asr"], 0, true, 1_000).Select(h => h.Name).ToList(),
+        ["hi", "hi2", "mid"],
+        "多标签交集 + 排序");
+    if (mesh.Capability(["ocr", "asr"], 6, true, 1_000).Count != 2) throw new Exception("min_qos=6 应滤掉 mid");
+    if (mesh.Capability(["ocr", "asr", "tts"], 0, true, 1_000).Count != 1) throw new Exception("三标签交集应仅剩 hi2");
+}
+
+static string TunnelProtoText()
+    => File.ReadAllText(FindRepoFile(Path.Combine("shared", "ipv8-proto", "tunnel.proto")));
+
+static string ProtoFlat()
+    => string.Join('\n', TunnelProtoText().Split('\n').Select(l => l.Trim()));
+
+static void TunnelProtoStreamInOutShapes()
+{
+    // tunnel.proto 是跨语言接口唯一权威；字段号/oneof 形状 = 生成代码前的冻结面，
+    // 漂移即双侧反序列化错位 → 锁 message/字段名与号。
+    var flat = ProtoFlat();
+    string[] want =
+    [
+        "message StreamIn {", "oneof payload {",
+        "TunPacket tun = 1;", "WireFrame wire = 2;",
+        "message StreamOut {",
+        "WireFrame to_wire = 1;", "TunPacket to_tun = 2;",
+        "bytes raw = 1;", // TunPacket / WireFrame 裸帧零包装
+    ];
+    foreach (var w in want)
+    {
+        if (!flat.Contains(w, StringComparison.Ordinal)) throw new Exception($"proto 形状缺项: {w}");
+    }
+    if (flat.Contains("bytes raw = 2", StringComparison.Ordinal)) throw new Exception("raw 字段号漂移（冻结面）");
+}
+
+static void TunnelProtoFallbackAndStatusFields()
+{
+    var rpcs = System.Text.RegularExpressions.Regex
+        .Matches(TunnelProtoText(), @"rpc\s+(\w+)\s*\(")
+        .Select(m => m.Groups[1].Value)
+        .ToList();
+    ExpectSeq(
+        rpcs,
+        ["StreamPackets", "StartHandshake", "InjectFrame", "GetStatus", "SetResolved", "NextPath", "RecordFailure", "RecordSuccess"],
+        "TunnelEngine RPC 清单（数据面 1 + 控制面 3 + 降级决策 4）");
+    var flat = ProtoFlat();
+    string[] status =
+    [
+        "State state = 1;", "uint64 send_epoch = 2;", "string local_addr_text = 3;",
+        "string peer_addr_text = 4;", "uint64 sealed_outbound = 5;", "uint64 delivered_inbound = 6;",
+        "uint64 dropped_inbound = 7;", "bool authenticated = 8;", "string last_auth_error = 9;",
+        "FallbackLevel fallback_level = 10;",
+    ];
+    foreach (var s in status)
+    {
+        if (!flat.Contains(s, StringComparison.Ordinal)) throw new Exception($"TunnelStatus 缺字段: {s}");
+    }
+    foreach (var e in new[] { "IDLE = 1;", "INITIATING = 2;", "RESPONDING = 3;", "ESTABLISHED = 4;" })
+    {
+        if (!flat.Contains(e, StringComparison.Ordinal)) throw new Exception($"状态枚举缺项: {e}");
+    }
+    foreach (var lvl in new[] { "MAIN_TUNNEL = 1;", "ALT_TUNNEL = 2;", "PLAIN_TCP = 3;", "PLAIN_UDP = 4;" })
+    {
+        if (!flat.Contains(lvl, StringComparison.Ordinal)) throw new Exception($"降级级别缺项: {lvl}");
+    }
+}
+
+static void MockTunLifecycleStartStopReadWrite()
+{
+    // 宿主面向的 ITunAdapter 完整生命周期：启动 → 写回出口 → Dispose →
+    // 写入即抛（拷贝语义与关闭态契约），Dispose 幂等。
+    ITunAdapter tun = new MockTunAdapter();
+    tun.StartAsync().GetAwaiter().GetResult();
+    if (tun.Name != "MockTUN") throw new Exception("Name");
+    tun.WriteAsync(new byte[] { 1, 2 }).GetAwaiter().GetResult();
+    AssertEqual(new byte[] { 1, 2 }, ((MockTunAdapter)tun).ReadOutboundAsync().GetAwaiter().GetResult(), "outbound");
+    tun.Dispose();
+    try
+    {
+        tun.WriteAsync(new byte[] { 3 }).GetAwaiter().GetResult();
+        throw new Exception("Dispose 后 WriteAsync 应抛 ObjectDisposedException");
+    }
+    catch (ObjectDisposedException) { }
+    tun.Dispose(); // 幂等：二次 Dispose 不得抛
+}
+
+static void EventsAllSubtypesTimestampOverwriteComplete()
+{
+    // with { OccurredAt } 复制必须保留各子类型全部载荷字段（总线只换时间不丢数据）。
+    var t0 = new DateTimeOffset(2026, 9, 9, 12, 0, 0, TimeSpan.Zero);
+    var p = new PacketReceivedEvent(new byte[] { 7, 7 }) with { OccurredAt = t0 };
+    if (p.OccurredAt != t0 || p.RawPacket[0] != 7) throw new Exception("Packet");
+    var d = new DnsInterceptedEvent("job.ipv8.net") with { OccurredAt = t0 };
+    if (d.OccurredAt != t0 || d.QueryName != "job.ipv8.net") throw new Exception("Dns");
+    var est = new TunnelEstablishedEvent("addr-1", 3) with { OccurredAt = t0 };
+    if (est.OccurredAt != t0 || est.PeerAddrText != "addr-1" || est.InitialEpoch != 3) throw new Exception("Tunnel");
+    var fb = new FallbackTriggeredEvent("addr-1", 2, "plain tcp") with { OccurredAt = t0 };
+    if (fb.OccurredAt != t0 || fb.Level != 2 || fb.Reason != "plain tcp") throw new Exception("Fallback");
+    // 默认时间戳保持新鲜（杜绝零值事件流入总线）
+    if (new DnsInterceptedEvent("x").OccurredAt < new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero))
+    {
+        throw new Exception("默认时间戳异常");
+    }
 }

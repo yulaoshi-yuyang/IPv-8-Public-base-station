@@ -113,7 +113,7 @@ pub struct Engine {
     forwarded: u64,
     /// 验证失败被拒的转发包数（含本不该找上我的
     fwd_rejected: u64,
-    /// 数据面已移交 FlowShards 分片（ADR-026）：单点 seal/Data 处理冻结，
+    /// 数据面已移交 FlowShards 分片（ADR-024 用户态性能线）：单点 seal/Data 处理冻结，
     /// keys 已派生至各分片 SA。握手状态机不受影响。
     sharded: bool,
 }
@@ -226,7 +226,7 @@ impl Engine {
         self.sharded
     }
 
-    /// 把已建立隧道的单点密钥状态拆成 N 个流级分片 SA（ADR-026 多核扩展）。
+    /// 把已建立隧道的单点密钥状态拆成 N 个流级分片 SA（ADR-024 用户态性能线：多核扩展）。
     ///
     /// 调用后本引擎进入「控制面模式」：`seal_frame`/`seal_frames`/`seal_prebuilt`
     /// 与 Data 帧处理一律拒绝（`NotEstablished`），数据面由上层

@@ -5,6 +5,18 @@
 
 ## [Unreleased]
 
+### 多核数据面（2026-09-09，ADR-024 用户态性能线）
+- 新增 `ipv8-tunnel::flow::FlowShards`：Data 面 N-worker 流级分片，同流同 worker 保 nonce 唯一，epoch 同余类（`epoch ≡ shard mod stride`）免解密路由；线格式零改动
+- `TunnelKeys` 加分片 SA（`with_shard`/`derive_shard`/`shard`/`stride`），轮换步幅 = 分片数，宽限期按代换算；默认 stride=1 逐字节零回归
+- `Engine::split_shards(n)` 移交数据面并冻结单点 seal/Data，握手状态机保留；新 Init 重协商自动解冻（4 处握手点统一置 `sharded=false`）
+- `ipv8-node --shards N`（默认 1）：Established 后主循环自动装填 worker，TUN 读线程分片优先投递、UDP 收线程 Data 帧按同余接管，`[stats]` 聚合分片计数并显示 `shards=`；仅真实 TUN 路径生效，`--no-tun` 回显验证件恒单点
+- 分片错配（两端 N 不一致）经回归测试证明为**可诊断丢包、无损坏交付**
+- 修正注释中把该性能线误标为 ADR-026 的引用，归正为 ADR-024（026 是 NAT 三级梯子提案）
+
+### 测试
+- Rust：新增 `flow.rs` 7 项分片单测（往返/套件/错配/分片重组/冻结/哈希打散）+ bench `flow_shards_scaling`；总数 213 → 227
+- C#：`TestRunner` 25 → 36 项集成测试——NRPT 真实脚本执行（绝对/相对路径，带 BOM 防 PS5.1 GBK 误读中文路径）、QoS 并发入队守恒/出队无重无失/丢弃计数单调、AgentMesh 同名不同址共存/多标签交集排序、`tunnel.proto` 冻结面（RPC 清单 + TunnelStatus 字段 + 枚举）、MockTun 生命周期、Events 全子类型 `with` 复制完整性
+
 ### 工程化（2026-09-09）
 - 建立 git 仓库（初始提交含 140 文件），`.gitignore` 排除 exe/zip/工具二进制与一次性分享产物
 - `scripts/make-peer-pack.ps1`：跨机验证包（`deploy/cross-verify/` + zip）唯一再生成入口，禁止手工复制 exe

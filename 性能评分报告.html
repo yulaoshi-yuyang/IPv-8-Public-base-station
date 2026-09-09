@@ -187,12 +187,12 @@
   <div class="header">
     <h1>IPv8+ 性能评分报告</h1>
     <div class="subtitle">协议引擎 · 代码质量 · 功能完整度 · 工程化水平</div>
-    <div class="date">评估日期：2026-09-09（v2 · 回填 AES-256-GCM 实测与 git 初始化后状态）｜ 基线硬件：i9-13900H / 16GB RAM / Windows 11</div>
+    <div class="date">评估日期：2026-09-09（v3 · 回填流级分片多核实测与 C# 集成测试扩展）｜ 基线硬件：i9-13900H / 16GB RAM / Windows 11</div>
   </div>
 
   <!-- 总分 -->
   <div class="total-score">
-    <div class="score">92</div>
+    <div class="score">93</div>
     <div class="label">综合评分 / 100</div>
     <div class="grade">★ 优秀（A）</div>
   </div>
@@ -202,15 +202,15 @@
     <div class="dim-card">
       <div class="dim-header">
         <span class="dim-title">协议引擎性能</span>
-        <span class="dim-score">27<span class="out-of"> / 30</span></span>
+        <span class="dim-score">28<span class="out-of"> / 30</span></span>
       </div>
       <div class="progress-bar">
-        <div class="progress-fill excellent" style="width: 90%"></div>
+        <div class="progress-fill excellent" style="width: 93.3%"></div>
       </div>
       <ul class="metric-list">
-        <li><span class="metric-name">引擎单程吞吐（AES）</span><span class="metric-val pass">7.5 Gbps</span></li>
-        <li><span class="metric-name">引擎单程吞吐（ChaCha）</span><span class="metric-val">3.6 Gbps</span></li>
-        <li><span class="metric-name">AEAD 往返（AES）</span><span class="metric-val pass">1.03 GiB/s seal</span></li>
+        <li><span class="metric-name">单线程引擎（AES）</span><span class="metric-val pass">7.5 Gbps</span></li>
+        <li><span class="metric-name">流级 8 分片（AES，含搬运）</span><span class="metric-val pass">10.9 Gbps</span></li>
+        <li><span class="metric-name">流级 8 分片（ChaCha）</span><span class="metric-val">7.5 Gbps</span></li>
         <li><span class="metric-name">引擎 overhead</span><span class="metric-val pass">~13%</span></li>
       </ul>
     </div>
@@ -224,8 +224,8 @@
         <div class="progress-fill excellent" style="width: 96%"></div>
       </div>
       <ul class="metric-list">
-        <li><span class="metric-name">Rust 测试数</span><span class="metric-val">213 项</span></li>
-        <li><span class="metric-name">C# 测试通过率</span><span class="metric-val pass">25/25 (100%)</span></li>
+        <li><span class="metric-name">Rust 测试数</span><span class="metric-val">227 项</span></li>
+        <li><span class="metric-name">C# 测试通过率</span><span class="metric-val pass">36/36 (100%)</span></li>
         <li><span class="metric-name">构建警告</span><span class="metric-val pass">0</span></li>
         <li><span class="metric-name">Clippy 警告</span><span class="metric-val pass">0</span></li>
       </ul>
@@ -315,9 +315,27 @@
           <td colspan="2">23.7 µs/包</td>
           <td class="val-ok">≈ 0.42 Mpps 封顶</td>
         </tr>
+        <tr>
+          <td>流级分片 2 workers（seal→feed→open 往返，含搬运）</td>
+          <td>0.53 GiB/s（4.7 Gbps）</td>
+          <td class="val-good">0.83 GiB/s（7.4 Gbps）</td>
+          <td class="val-good">AES 1.38×/n1</td>
+        </tr>
+        <tr>
+          <td>流级分片 4 workers</td>
+          <td>0.80 GiB/s（7.1 Gbps）</td>
+          <td class="val-good">1.12 GiB/s（10.0 Gbps）</td>
+          <td class="val-good">AES 1.87×/n1</td>
+        </tr>
+        <tr>
+          <td>流级分片 8 workers</td>
+          <td>0.84 GiB/s（7.5 Gbps）</td>
+          <td class="val-good"><strong>1.23 GiB/s（10.9 Gbps）</strong></td>
+          <td class="val-good">AES 2.05×/n1（4 片后平台期）</td>
+        </tr>
       </tbody>
     </table>
-    <p class="val-note" style="margin-top: 12px;">注：i9-13900H 单线程 release 构建 2026-09-09 实测（bench_dataplane 双套件版）。AES-NI 使引擎上限从 3.6 Gbps 提至 7.5 Gbps（+108%）；剩余瓶颈转为 RouteTrace 验签与单线程上限（流级多核为下一杠杆）。默认套件仍为 ChaCha（Phase 1-4 线上兼容），AES 通过 Engine::set_cipher_suite 部署启用。</p>
+    <p class="val-note" style="margin-top: 12px;">注：i9-13900H 单线程 release 构建 2026-09-09 实测（bench_dataplane 双套件版）。AES-NI 使引擎上限从 3.6 Gbps 提至 7.5 Gbps（+108%）。流级分片行含 channel 搬运与 64 流注入开销（bench 单线程搬运是显式瓶颈上界），为保守口径：AES 1→4 workers 近线性（1.87×），4→8 进入平台期（2.05×）——瓶颈转移到基准的搬运线程，真实部署中该角色由 OS/网卡承担。默认套件仍为 ChaCha（Phase 1-4 线上兼容），AES 与分片均经部署配置（--shards / set_cipher_suite）启用，两端必须一致（错配=可诊断丢包，无损坏交付，有回归测试锁定）。</p>
   </div>
 
   <!-- 通包验证记录 -->
@@ -402,14 +420,14 @@
         <tr>
           <td>协议引擎性能</td>
           <td>30%</td>
-          <td>27 / 30</td>
-          <td>AES-NI 实测 7.5 Gbps（-2 距 10Gbps+ 仍受单线程上限；-1 RouteTrace 验签 23.7µs 封顶多跳路径）</td>
+          <td>28 / 30</td>
+          <td>流级分片已落地（AES n=8 10.9 Gbps），但 bench 口径含单线程搬运上界，端到端（socket/TUN）多核收益待真机回填（-2）</td>
         </tr>
         <tr>
           <td>代码质量</td>
           <td>25%</td>
           <td>24 / 25</td>
-          <td>C# 侧测试量偏少（25 项 vs Rust 213 项；gRPC 真集成测试受 NuGet 限制未做）（-1）</td>
+          <td>C# 36 项含集成层（真实脚本执行/并发/契约冻结），但 gRPC 真桥接集成仍受 NuGet 限制未做（-1）</td>
         </tr>
         <tr>
           <td>功能完整度</td>
@@ -421,7 +439,7 @@
           <td>工程化水平</td>
           <td>20%</td>
           <td>19 / 20</td>
-          <td>git 本地仓库已建立（初始提交 9b602ab，140 文件）；ci.yml/CONTRIBUTING 就绪，但尚未推送远端，Actions 未实际运行（-1）</td>
+          <td>git 仓库 + CONTRIBUTING + ci.yml + peer-pack 单一入口 + ADR 索引全部落地；ci.yml 尚未在远端实际跑过一次（待推送）（-1）</td>
         </tr>
       </tbody>
     </table>
@@ -432,15 +450,15 @@
     <h2>五、下一步优化建议</h2>
     <ol class="suggestions">
       <li><strong>✅ 已完成：启用 AES-256-GCM 套件并实测</strong><br>ADR-025 双套件已落地，本轮 bench 实测确认 AES-NI 使引擎单程吞吐 3.6 → 7.5 Gbps。生产部署通过 Engine::set_cipher_suite 在握手前启用；默认仍保持 ChaCha 以兼容 Phase 1-4 线上格式。</li>
-      <li><strong>推送远端仓库，激活 CI</strong><br>本地 git 仓库已建立（初始提交 9b602ab）。推送到 GitHub/Gitee 后 .github/workflows/ci.yml 即接管 clippy -D warnings + cargo test + dotnet build/test 门禁，杜绝质量回退。</li>
-      <li><strong>补跨机真网实测数据</strong><br>同机回环已全绿；09-09 现场诊断确认本机 WLAN 当前无公网入口（v4 NAT + 无 v6 GUA），跨机直连需换网络环境或走 WS 中转链路回填。找两台可达机器跑 verify-cross.ps1，补 RTT、丢包率、吞吐。</li>
-      <li><strong>流级多核扩展</strong><br>AES 之后单线程引擎不再是首要瓶颈，RouteTrace 验签（23.7 µs/包）与单核上限成为新天花板。按流（五元组）分片到多 worker 是下一个最大杠杆。</li>
-      <li><strong>补充 C# 侧集成测试</strong><br>C# 侧已扩至 25 项；gRPC 桥接集成测试受 NuGet 未解禁限制仍未做，环境解锁后优先补齐。</li>
+      <li><strong>✅ 已完成：流级多核扩展（ADR-024 用户态性能线）</strong><br>FlowShards N-worker 数据面 + epoch 同余路由 + ipv8-node --shards 接线；实测 AES 4 分片 10.0 Gbps / 8 分片 10.9 Gbps。剩余：真机端到端（TUN+UDP 多核）吞吐回填与 n>4 平台期的搬运侧优化。</li>
+      <li><strong>✅ 大部分完成：C# 测试扩至 36 项</strong><br>新增 NRPT 真实脚本执行（绝对/相对路径）、QoS 并发守恒/无重无失、AgentMesh 同名共存/多标签排序、tunnel.proto 冻结面、MockTun 生命周期。gRPC 真桥接集成仍受 NuGet 未解禁限制；环境解锁后补 StreamPackets 端到端。</li>
+      <li><strong>推送远端仓库，激活 CI</strong><br>本地 git 仓库已建立。推送到 GitHub/Gitee 后 .github/workflows/ci.yml 即接管 clippy -D warnings + cargo test + dotnet build/test 门禁，杜绝质量回退。</li>
+      <li><strong>补跨机真网实测数据</strong><br>同机回环已全绿；本机 WLAN 当前无公网入口（v4 NAT + 无 v6 GUA），跨机直连需换网络环境或走 WS 中转链路回填。找两台可达机器跑 verify-cross.ps1，补 RTT、丢包率、吞吐（含 --shards 对照）。</li>
     </ol>
   </div>
 
   <div class="footer">
-    IPv8+ 性能评分报告 · v2 · 更新于 2026-09-09 · 基于 Phase 5 完成 + AES-256-GCM 实测 + git 初始化后状态评估
+    IPv8+ 性能评分报告 · v3 · 更新于 2026-09-09 · 基于 Phase 5 完成 + AES-256-GCM 实测 + 流级分片多核 + git 初始化后状态评估
   </div>
 </div>
 </body>

@@ -186,7 +186,7 @@ pub struct TunnelKeys {
     epoch_created: Instant,
     epoch_bytes: u64,
     tx_counter: u64,
-    /// 流级分片编号（ADR-026 性能线；0 = 非分片，与历史行为一致）
+    /// 流级分片编号（ADR-024 用户态性能线；0 = 非分片，与历史行为一致）
     shard: u64,
     /// epoch 推进步幅 = 分片总数（默认 1：逐代 +1，Phase 1-5 零回归）。
     /// 分片 k 的 epoch 序列 ≡ k (mod stride)，接收端凭 `epoch % stride`
@@ -281,7 +281,7 @@ impl TunnelKeys {
         k
     }
 
-    /// 流级分片 SA 构造（ADR-026 性能线）：本实例只处理 `epoch ≡ shard
+    /// 流级分片 SA 构造（ADR-024 用户态性能线）：本实例只处理 `epoch ≡ shard
     /// (mod stride)` 的帧，轮换时 epoch += stride。同一隧道的 N 个分片
     /// 各持一个实例，跨线程无锁并发（每片内部仍是单线程计数器语义）。
     /// 两端的 (shard, stride) 配置必须人工一致——不一致在 `open` 处
