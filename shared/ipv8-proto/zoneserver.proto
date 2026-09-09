@@ -1,0 +1,58 @@
+// zoneserver.proto — 设备注册 / 证书签发 / JWT 认证服务契约（v9 §5 cloud/IPv8Plus.ZoneServer 的 Rust 先行版）
+//
+// 权威来源声明：本文件是该接口的唯一权威。
+// 信任模型（Phase 2 最小版）：
+//   - 节点生成 Ed25519 签名密钥对（私钥永不出本机），持 PoP 签名来注册；
+//   - ZoneServer 验证 PoP（防止冒注他人公钥）后签发证书（addr ↔ ed_pub ↔ not_after，CA 签名）
+//     并颁发 JWT（HS256，sub=addr，含 iat/exp）；
+//   - 后续敏感操作（RotateKey）凭 JWT 授权；
+//   - 节点同时取回 GetTrustAnchor（CA 公钥）作为握手信任锚。
+//   - 生产演进：多租户/审批流/API key 门槛属 Phase 3+（ADR-007/021）。
+
+syntax = "proto3";
+
+package ipv8plus.zoneserver.v1;
+
+option csharp_namespace = "IPv8Plus.Proto.ZoneServer.V1";
+
+message RegisterRequest {
+  string addr_text = 1;       // 申请的 IPv8+ 地址（32hex，spec §3.2）
+  bytes  ed_pub = 2;          // 32B Ed25519 公钥
+  bytes  proof = 3;           // 64B PoP：对该新密钥签名 over ("ipv8plus-register" ‖ addr_text ‖ ed_pub)
+  string label = 4;          // 人类可读备注（可选）
+}
+
+message RegisterResponse {
+  bytes  verify_key = 1;      // 回显证书内公钥（32B）
+  uint64 not_after = 2;       // 证书有效期（epoch 秒；u64::MAX = 永久）
+  bytes  ca_sig = 3;          // CA 对 addr ‖ verify_key ‖ not_after 的签名（64B）
+  string jwt = 4;             // 颁发的会话令牌（HS256 JWT）
+}
+
+message GetTrustAnchorRequest {}
+message GetTrustAnchorResponse {
+  bytes ca_pub = 1;           // 32B CA Ed25519 公钥（节点信任锚）
+}
+
+message RotateKeyRequest {
+  string jwt = 1;             // 注册时颁发的令牌，sub 即设备地址
+  bytes  new_ed_pub = 2;      // 新公钥（旧私钥即刻作废，证书重签）
+  bytes  proof = 3;           // 64B PoP：新密钥签名 over ("ipv8plus-rotate" ‖ addr_text ‖ new_ed_pub)。
+                              // 无 PoP 则窃取 JWT 者可任意更换设备公钥 —— 必须验证。
+}
+
+message VerifyTokenRequest {
+  string jwt = 1;
+}
+message VerifyTokenResponse {
+  bool   ok = 1;
+  string sub = 2;             // addr_text
+  uint64 exp = 3;
+}
+
+service ZoneServer {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc GetTrustAnchor(GetTrustAnchorRequest) returns (GetTrustAnchorResponse);
+  rpc RotateKey(RotateKeyRequest) returns (RegisterResponse);
+  rpc VerifyToken(VerifyTokenRequest) returns (VerifyTokenResponse);
+}

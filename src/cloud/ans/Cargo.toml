@@ -1,0 +1,29 @@
+[package]
+name = "ipv8-ans"
+description = "ANS 智能体命名服务（v9 Phase 4 / ADR-022/023）：AgentCard 注册、名字/能力/任务三维寻址、租约式任务计划"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ipv8-ans"
+path = "src/main.rs"
+
+[dependencies]
+ipv8-codec = { workspace = true }
+ipv8-routing = { path = "../../core/ipv8-routing" }
+ed25519-dalek = { workspace = true }
+rand_core = { workspace = true }
+sha2 = { workspace = true }
+tonic = { version = "0.12", features = ["transport"] }
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[build-dependencies]
+tonic-build = "0.12"
+protox = "0.7"
+prost-types = "0.13"

@@ -1,0 +1,49 @@
+// IPv8+ Resolver 契约（v9 §云端 Resolver 权威定义的逐字落地）
+//
+// 一次 RPC 原子返回全部解析信息，避免 A 记录 + TXT 记录分两次查询的竞态。
+// 隐私姿态（ADR-007）：匿名查询（不要求调用方出示凭据）、响应只含路由
+// 必需字段、ttl 驱动客户端缓存；端点全配置化（ADR-021，本文件零硬编码）。
+
+syntax = "proto3";
+
+package ipv8plus.resolver.v1;
+
+service Resolver {
+  // ★ 一次 RPC 返回所有信息，避免 A 记录 + TXT 记录分两次查询的竞态
+  rpc Resolve(ResolveRequest) returns (ResolveResponse);
+  // 节点登记自己的隧道入口（注册后域名才可解析；PoP 语义与 ZoneServer 同源）
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+}
+
+message ResolveRequest {
+  // 查询目标：IPv8+ 地址规范文本（canonical 32hex）。
+  // 域名式查询（myagent.ipv8.net）的映射属 ANS 层（v9 §ANS，Phase 4）——
+  // 本服务只回答"这个节点的隧道入口在哪、能不能建 IPv8+ 隧道"，
+  // 且 ADR-021 禁止协议/契约绑定任何具体命名空间根。
+  string target_addr = 1;
+  string client_ipv8_addr = 2;  // 查询方的 IPv8+ 地址（用于路由优化；可空=匿名）
+}
+
+message ResolveResponse {
+  string tunnel_entry_ip = 1;   // 隧道入口 IP
+  bool   ipv8_capable = 2;      // 对方是否支持 IPv8+（原 TXT 记录语义）
+  uint32 mtu = 3;               // 对方建议 MTU
+  repeated string alt_ips = 4;  // 备用隧道入口 IP
+  uint32 ttl = 5;               // 缓存 TTL（秒）
+}
+
+message RegisterRequest {
+  string name = 1;              // 域名（须以配置的命名空间根结尾）
+  string addr_text = 2;         // 本节点 IPv8+ 地址（canonical 32hex）
+  bytes  ed_pub = 3;            // 32B Ed25519 公钥
+  bytes  proof = 4;             // 64B PoP：签名 over ("ipv8plus-resolve-register" ‖ name ‖ addr_text ‖ ed_pub)
+  string tunnel_entry = 5;      // "ip:port" 隧道入口
+  repeated string alt_entries = 6; // 备用入口 "ip:port" 列表
+  uint32 mtu = 7;               // 建议 MTU（0 = 服务端默认）
+  uint32 ttl = 8;               // 请求的 TTL（0 = 服务端默认；上限服务端裁剪）
+  bool   ipv8_capable = 9;      // 能力声明（Fallback 契约的 ipv8_capable 源头）
+}
+
+message RegisterResponse {
+  uint32 ttl = 1;               // 实际生效 TTL（服务端可能下调）
+}

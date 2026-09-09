@@ -1,0 +1,116 @@
+;/*++
+
+Copyright (c) IPv8+ Project. All rights reserved.
+
+Module Name:
+
+    ipv8proto.inf
+
+Abstract:
+
+    INF file for installing the IPv8 NDIS Protocol Driver.
+    This makes "Internet Protocol Version 8 (TCP/IPv8)" appear in the
+    network adapter properties list, just like IPv4/IPv6.
+
+--*/
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = NetTrans
+ClassGUID   = {4d36e975-e325-11ce-bfc1-08002be10318}
+Provider    = %IPv8_Provider%
+DriverVer   = 09/09/2026,0.9.0.0
+CatalogFile = ipv8proto.cat
+PnpLockdown = 1
+
+[Manufacturer]
+%IPv8_Provider% = IPv8, NT$ARCH$, NT$ARCH$.6.1
+
+[IPv8.NT$ARCH$]
+%IPv8_ProtocolDesc% = IPv8_Install, ms_ag1
+
+[IPv8.NT$ARCH$.6.1]
+%IPv8_ProtocolDesc% = IPv8_Install, ms_ag1
+
+; =============================================================================
+; Installation section
+; =============================================================================
+
+[IPv8_Install]
+Characteristics = 0x10 ; NCF_HIDDEN - hide from "Add Protocol" dialog, use our installer
+AddReg          = IPv8_AddReg
+CopyFiles       = IPv8_CopyFiles
+BusType         = 1  ; BusTypeIsIsa (virtual)
+LockType        = 1  ; LOCKTYPE_VXD (no reboot needed for bind/unbind)
+
+[IPv8_Install.Services]
+AddService = %IPv8_ServiceName%, 0x00000002, IPv8_ServiceInst
+
+[IPv8_ServiceInst]
+DisplayName    = %IPv8_ServiceName%
+ServiceType    = 1   ; SERVICE_KERNEL_DRIVER
+StartType      = 3   ; SERVICE_DEMAND_START
+ErrorControl   = 1   ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\ipv8proto.sys
+LoadOrderGroup = PNP_TDI
+Dependencies   = NDIS
+
+[IPv8_CopyFiles]
+ipv8proto.sys
+
+; =============================================================================
+; Registry settings
+; =============================================================================
+
+[IPv8_AddReg]
+HKR, Ndi, Service,              0, %IPv8_ServiceName%
+HKR, Ndi, HelpText,             0, %IPv8_HelpText%
+HKR, Ndi\Interfaces, UpperRange, 0, "noupper"
+HKR, Ndi\Interfaces, LowerRange, 0, "ndis5,ndis5_ipsec"
+HKR, Ndi\Interfaces, LowerRange, 0, "ndis5"
+HKR, Ndi, MediaType,            0, "1"
+HKR, Ndi, FrameType,            0, "0x0800"
+HKR, Ndi, FilterMediaTypes,     0, "ethernet,tokenring,fddi,wan,tunnel,pppoe"
+
+; Show in "This connection uses the following items" list
+HKR, Ndi, ComponentType,        0, "protocol"
+HKR, Ndi, CoServices,           0x10000, %IPv8_ServiceName%
+HKR, Ndi, Description,          0, %IPv8_ProtocolDesc%
+HKR, Ndi, Icon,                 0, "netcfgx.dll,-50004"
+
+; Properties page support (the "属性" button)
+HKR, Ndi, PropertyPages,        0, "ipv8prop.dll,IPv8PropPages"
+HKR, Ndi, NeedRestart,          0, "0"
+
+; Bind to all adapters by default
+HKR, Ndi\Bindings, BindForm,    0, "TEXTLINE"
+HKR, Ndi\Bindings, BindList,    0, ""
+
+; =============================================================================
+; Destination directories
+; =============================================================================
+
+[DestinationDirs]
+IPv8_CopyFiles = 12   ; %windir%\system32\drivers
+DefaultDestDir  = 12
+
+; =============================================================================
+; Source disk layout
+; =============================================================================
+
+[SourceDisksNames]
+1 = %SourceDisk%,,,
+
+[SourceDisksFiles]
+ipv8proto.sys = 1
+
+; =============================================================================
+; Strings
+; =============================================================================
+
+[Strings]
+IPv8_Provider      = "IPv8+ Project"
+IPv8_ProtocolDesc  = "Internet 协议版本 8 (TCP/IPv8)"
+IPv8_ServiceName   = "IPv8Proto"
+IPv8_HelpText      = "IPv8+ 协议驱动：基于身份的覆盖网络协议，提供端到端加密、多跳路由与能力寻址"
+SourceDisk         = "IPv8 Protocol Driver Installation Disk"

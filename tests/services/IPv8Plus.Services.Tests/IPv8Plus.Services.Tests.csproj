@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <Description>服务层契约测试运行器（零外部包；xunit 待联网后替换）</Description>
+  </PropertyGroup>
+
+  <!-- Abstractions：无外部依赖，直接项目引用。
+       Host（Exe + FrameworkReference）在本机 SDK 上经项目引用触发还原图静默失败，
+       故其被测类型 ClientOptions 以 Compile Link 方式源码级共享（同一份定义，无双维护）。 -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\src\services\IPv8Plus.Abstractions\IPv8Plus.Abstractions.csproj" />
+    <Compile Include="..\..\..\src\services\IPv8Plus.Host\ClientOptions.cs" Link="Linked\ClientOptions.cs" />
+    <Compile Include="..\..\..\src\services\IPv8Plus.Host\QoSManagerService.cs" Link="Linked\QoSManagerService.cs" />
+    <Compile Include="..\..\..\src\services\IPv8Plus.Host\AgentMeshService.cs" Link="Linked\AgentMeshService.cs" />
+    <!-- NrptCleanupService 仅依赖 IHostedService/ILogger/IOptions（均由 AspNetCore.App
+         共享框架提供），无进程副作用的分支可离线测试，故同样源码级共享。 -->
+    <Compile Include="..\..\..\src\services\IPv8Plus.Host\NrptCleanupService.cs" Link="Linked\NrptCleanupService.cs" />
+  </ItemGroup>
+
+  <!-- Microsoft.Extensions.Configuration.Json：由共享框架提供 -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+</Project>

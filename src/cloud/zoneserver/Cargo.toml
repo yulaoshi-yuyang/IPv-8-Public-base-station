@@ -1,0 +1,30 @@
+[package]
+name = "ipv8-zoneserver"
+description = "ZoneServer 最小实现：PoP 注册、Ed25519 证书签发、HS256 JWT、信任锚下发"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ipv8-zoneserver"
+path = "src/main.rs"
+
+[dependencies]
+ipv8-codec = { workspace = true }
+ipv8-tunnel = { path = "../../core/ipv8-tunnel" }
+ed25519-dalek = { workspace = true }
+hmac = "0.12"
+sha2 = { workspace = true }
+rand_core = { workspace = true }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tonic = { version = "0.12", features = ["transport"] }
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+protox = "0.7"
+prost-types = "0.13"

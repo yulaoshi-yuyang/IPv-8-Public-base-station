@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <OutputType>Exe</OutputType>
+    <Description>IPv8+ 客户端统一启动入口（权限检查 + 配置加载 + 依赖注入）</Description>
+  </PropertyGroup>
+
+  <!-- v9 §4 依赖方向：Host 只引用 Abstractions 契约；
+       wintun 适配层由组合根在装配期接入，不形成编译期反向依赖。 -->
+  <ItemGroup>
+    <ProjectReference Include="..\IPv8Plus.Abstractions\IPv8Plus.Abstractions.csproj" />
+  </ItemGroup>
+
+  <!-- Microsoft.Extensions.* / Hosting 随 .NET SDK 共享框架提供，无需 NuGet 包 -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="appsettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,23 @@
+[package]
+name = "ipv8-resolver"
+description = "Resolver 最小实现（v9 权威 gRPC）：域名→隧道入口原子解析、PoP 登记、TTL 缓存语义（ADR-007 最小披露）"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ipv8-resolver"
+path = "src/main.rs"
+
+[dependencies]
+ipv8-codec = { workspace = true }
+ed25519-dalek = { workspace = true }
+tonic = { version = "0.12", features = ["transport"] }
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+protox = "0.7"
+prost-types = "0.13"

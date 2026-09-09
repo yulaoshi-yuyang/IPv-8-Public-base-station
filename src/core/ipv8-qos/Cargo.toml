@@ -1,0 +1,9 @@
+[package]
+name = "ipv8-qos"
+description = "IPv8+ QoS 引擎（v9 §Phase 3）：流量分类（基头 QoS Level）+ 4 级优先调度 + QoSReservation 报文构造"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+ipv8-codec = { workspace = true }

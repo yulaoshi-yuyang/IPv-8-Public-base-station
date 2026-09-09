@@ -1,0 +1,14 @@
+[package]
+name = "ipv8-routing"
+description = "IPv8+ 多跳路由决策层（ADR-019 源路由+路径签名）：RouteTrace 构建/验证、Router 抽象、静态源路由；chord feature 为 Chord 一致性哈希骨架（不进验收）"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+ipv8-codec = { workspace = true }
+ed25519-dalek = { workspace = true }
+
+[features]
+# Chord 自主路由骨架（v9 规划但 ADR-019 决议不进本轮验收）
+chord = []

@@ -1,0 +1,13 @@
+[package]
+name = "ipv8-ws-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cloudflare WebSocket 桥：把原生 AEAD 隧道端点经 WS 暴露到公网（外网定向测试用）"
+
+[dependencies]
+ipv8-tunnel = { path = "../../core/ipv8-tunnel" }
+ipv8-codec = { path = "../../core/ipv8-codec" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"

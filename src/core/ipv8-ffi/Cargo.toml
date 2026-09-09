@@ -1,0 +1,12 @@
+[package]
+name = "ipv8-ffi"
+description = "FFI 桥接层：仅 Phase 0 编解码验证使用，Phase 1 起冻结（ADR-008）"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ipv8-codec = { workspace = true }

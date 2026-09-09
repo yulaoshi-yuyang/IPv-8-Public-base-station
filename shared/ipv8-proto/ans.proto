@@ -1,0 +1,113 @@
+// IPv8+ ANS 契约（v9 §ANS/answer.proto 权威定义的 Phase 4 落地）
+//
+// ANS 管"智能体语义"：name↔addr↔卡片、能力寻址、任务寻址（ADR-023 §1 边界）。
+// 身份/网络位置分别归 ZoneServer / Resolver，ANS 只引用不重发明。
+// 隐私（ADR-007）：寻址查询匿名；NotFound 不区分未登记与已过期（防枚举）。
+// 端点/命名空间根全配置化（ADR-021，本文件零硬编码）。
+
+syntax = "proto3";
+
+package ipv8plus.ans.v1;
+
+service ANS {
+  // 登记/更新智能体卡片（证书 + CardSig + PoP 三验，ADR-023 §1）
+  rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);
+  // 直接寻址：name → 读模型
+  rpc ResolveName(ResolveNameRequest) returns (AgentView);
+  // 能力寻址：标签集 → 候选（精确覆盖 + qos 过滤 + 打分排序）
+  rpc Capability(CapabilityRequest) returns (CapabilityResponse);
+  // 任务寻址：TaskDescription → 分片计划 + 起租（防并发双订）
+  rpc PlanTask(PlanTaskRequest) returns (Plan);
+  // 回报完成：释放该 plan 对该 agent 的租约
+  rpc ReportDone(ReportDoneRequest) returns (ReportDoneResponse);
+}
+
+// ANS 侧全量卡片（AgentCard 的 proto 形态；哈希在 ANS 端计算）
+message AgentCard {
+  uint32 version = 1;           // 卡片格式版本（当前 = 1）
+  string name = 2;              // 全名（须以服务端配置的命名空间根结尾）
+  string addr_text = 3;         // canonical 32hex
+  repeated string capabilities = 4; // §6.8 能力标签
+  repeated string endpoints = 5;    // 可选端点 "ip:port"
+  uint32 qos_hint = 6;          // 0-15
+  uint64 not_after = 7;         // 有效期 epoch 秒
+  string tunnel_entry = 8;      // 读模型（权威属 Resolver，ADR-023 §1）
+}
+
+message RegisterAgentRequest {
+  string addr_text = 1;         // 与卡片 addr 一致，服务端交叉校验
+  bytes  cert_wire = 2;         // 120B 证书线格式（ZoneServer 签发）
+  AgentCard card = 3;
+  bytes  card_sig = 4;          // CardSig over ("ipv8plus-agentcard" ‖ v ‖ hash ‖ not ‖ pub)，64B
+  bytes  pop = 5;               // 登记持有证明 over ("ipv8plus-ans-register" ‖ name ‖ addr ‖ hash)，64B
+}
+
+message RegisterAgentResponse {
+  bytes card_hash = 1;          // 服务端计算并绑定的 16B 卡片哈希
+}
+
+// 寻址读模型（含摘要，供目的地重算哈希绑定）
+message AgentCardSummaryMsg {
+  uint32 version = 1;
+  bytes  card_hash = 2;         // 16B
+  uint64 not_after = 3;
+  bytes  agent_pubkey = 4;      // 32B
+  bytes  card_sig = 5;          // 64B
+}
+
+message AgentView {
+  string name = 1;
+  string addr_text = 2;
+  string tunnel_entry = 3;
+  repeated string capabilities = 4;
+  repeated string endpoints = 5;
+  uint32 qos_hint = 6;
+  uint64 not_after = 7;
+  AgentCardSummaryMsg summary = 8;
+}
+
+message ResolveNameRequest {
+  string name = 1;
+}
+
+message CapabilityRequest {
+  repeated string required_caps = 1;
+  uint32 min_qos = 2;           // qos_hint 下限
+  bool   exclude_leased = 3;    // 默认 true；发现型查询可置 false
+}
+
+message CapabilityResponse {
+  repeated AgentView agents = 1;
+}
+
+message TaskDescriptionMsg {
+  repeated string required_caps = 1;
+  uint32 min_count = 2;
+  uint32 qos_level = 3;
+  uint64 timeout_ms = 4;        // 租约时长（服务端裁剪 ≤3600s）
+}
+
+message PlanTaskRequest {
+  TaskDescriptionMsg task = 1;
+}
+
+message Assignment {
+  string addr_text = 1;
+  uint32 shard_id = 2;
+  uint64 lease_expiry = 3;      // epoch 秒
+}
+
+message Plan {
+  uint64 plan_id = 1;
+  repeated Assignment assignments = 2;
+  uint64 created_at = 3;
+}
+
+message ReportDoneRequest {
+  uint64 plan_id = 1;
+  string addr_text = 2;
+}
+
+message ReportDoneResponse {
+  bool released = 1;
+}

@@ -1,0 +1,21 @@
+[package]
+name = "ipv8-tunnel"
+description = "IPv8+ 隧道引擎：封装/拆壳、X25519 握手、ChaCha20-Poly1305、密钥轮换"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+ipv8-codec = { workspace = true }
+ipv8-routing = { path = "../ipv8-routing" }
+x25519-dalek = { workspace = true }
+ed25519-dalek = { workspace = true }
+chacha20poly1305 = { workspace = true }
+aes-gcm = "0.10"
+sha2 = { workspace = true }
+rand_core = { workspace = true }
+hmac = "0.12"
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+ipv8-qos = { path = "../ipv8-qos" }

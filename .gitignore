@@ -1,0 +1,61 @@
+# Rust
+/target
+**/target
+
+# C# / .NET
+*.pdb
+*.dll
+!deploy/client/**/*.dll
+bin/
+obj/
+*.user
+*.suo
+.vs/
+.idea/
+*.userosscache
+*.userprefs
+
+# Visual Studio
+.vs/
+.vscode/
+*.suo
+*.user
+
+# Rider
+.idea/
+
+# Build outputs
+publish/
+out/
+build/
+
+# Logs
+*.log
+logs/
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Test results
+TestResults/
+*.trx
+coverage/
+
+# Local config overrides
+appsettings.Local.json
+*.local.json
+
+# Tool caches
+.terraform/
+.node_modules/
+
+# Large binaries / tool archives (downloaded, not built from source)
+*.exe
+*.zip
+tools/cloudflared/cloudflared.exe
+scripts/ipv8-node.exe
+
+# One-off sharing artifacts
+.trae-html-share-packages/

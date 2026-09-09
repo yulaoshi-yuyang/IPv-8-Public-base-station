@@ -1,0 +1,8 @@
+[package]
+name = "ipv8-codec"
+description = "IPv8+ 包头编解码（纯函数，零依赖）"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- v9 方案写 .NET 9；本机仅有 .NET 10 SDK（向下兼容 net9 TFM 需另装 runtime），
+         构建统一用 net10.0，发布时按目标机 runtime 调整。 -->
+    <Description>跨层共享契约（v9：位于 services/，被 services 与 cloud 引用）</Description>
+  </PropertyGroup>
+
+</Project>

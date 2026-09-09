@@ -1,0 +1,31 @@
+# IPv8+ 协议引擎层 Rust workspace
+# 依赖方向铁律：core 内部 codec ← routing ← tunnel ← grpc，ffi 仅 Phase 0 使用
+
+[workspace]
+resolver = "2"
+members = [
+    "src/core/ipv8-codec",
+    "src/core/ipv8-routing",
+    "src/core/ipv8-qos",
+    "src/core/ipv8-tunnel",
+    "src/core/ipv8-grpc",
+    "src/core/ipv8-ffi",
+    "src/cloud/zoneserver",
+    "src/cloud/resolver",
+    "src/cloud/ans",
+    "src/adapter/wintun-node",
+    "src/tools/ws-node",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.9.0"
+license = "MIT"
+
+[workspace.dependencies]
+ipv8-codec = { path = "src/core/ipv8-codec" }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }

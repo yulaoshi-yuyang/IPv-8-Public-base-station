@@ -1,0 +1,7 @@
+<Project>
+  <!-- 本机 .NET 10 SDK 缺少 WorkloadAutoImportPropsLocator 目录（MSB4276），
+       纯 Windows 桌面工程不需要移动/AOT workload，全局关闭解析器。 -->
+  <PropertyGroup>
+    <MSBuildEnableWorkloadResolver>false</MSBuildEnableWorkloadResolver>
+  </PropertyGroup>
+</Project>

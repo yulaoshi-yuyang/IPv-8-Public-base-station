@@ -1,0 +1,20 @@
+[package]
+name = "ipv8-wintun-node"
+description = "Phase 1 通包验证守护进程：wintun TUN + UDP 外层 + gRPC TunnelEngine（Hyper-V 双 VM 用）"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ipv8-node"
+path = "src/main.rs"
+
+[dependencies]
+ipv8-codec = { workspace = true }
+ipv8-tunnel = { path = "../../core/ipv8-tunnel" }
+ipv8-grpc = { path = "../../core/ipv8-grpc" }
+ipv8-zoneserver = { path = "../../cloud/zoneserver" }
+wintun = "0.5.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+tokio-stream = "0.1"
+tonic = { version = "0.12", features = ["transport"] }

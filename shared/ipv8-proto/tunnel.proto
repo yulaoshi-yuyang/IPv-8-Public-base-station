@@ -1,0 +1,169 @@
+// tunnel.proto — C# 服务层 ↔ Rust 引擎的 gRPC 契约（v9 §6，tonic/Grpc.Tools 双端生成）
+//
+// 权威来源声明：本文件是跨语言接口的唯一权威（文档与代码只引用不复制）。
+// 帧字节 = 裸隧道帧（v9 决策：bytes raw = 1，零额外结构、小包低开销）。
+// 帧格式权威定义：docs/tunnel-protocol.md + ipv8-tunnel::frame（Rust 实现）。
+//
+// 数据面拓扑（v9 §2 + §6）：
+//   Rust 引擎持有 wintun session（读 OS 写入的内层 IP 包、写回拆壳结果）；
+//   C# 宿主持有 UDP socket（外层收发，与 Resolver/Fallback 同层协作）。
+//   StreamPackets 因此是双向泵：
+//     入向 TunPacket  = TUN 读到、待封装发往网络；
+//     入向 WireFrame  = 网络收到、待拆壳写回 TUN；
+//     出向 WireFrame  = 引擎封装/握手产生的待 UDP 发送帧；
+//     出向 TunPacket  = 引擎拆壳还原、待写回 TUN 的内层 IP 包。
+//   InjectFrame(unary) 保留为控制面即发即答路径（握手响应直接返回）。
+//
+// Phase 1 起 FFI 冻结（ADR-008），一切跨语言通信走本契约。
+//
+// Fallback（v9 §11）归属：降级状态机（ipv8-tunnel::fallback）由本桥持有，
+// C# 宿主只做 IO 与计时——SetResolved 喂 Resolver 结果，NextPath 问"下一个包
+// 走哪条路、握手给几秒"，RecordOutcome 报成败换级别。明文 TCP/UDP 传输不经
+// 引擎，由 C# 直用 socket 执行（本桥只返回决策）。
+
+syntax = "proto3";
+
+package ipv8plus.tunnel.v1;
+
+option csharp_namespace = "IPv8Plus.Proto.Tunnel.V1";
+
+// 内层原始 IP 包（OS ↔ TUN 之间的字节）
+message TunPacket {
+  bytes raw = 1;
+}
+
+// 裸隧道帧（Data/HandshakeInit/HandshakeResp/Rekey；C# ↔ UDP 之间的字节）
+message WireFrame {
+  bytes raw = 1;
+}
+
+message StreamIn {
+  oneof payload {
+    TunPacket tun = 1;   // 来自 TUN，待封装
+    WireFrame wire = 2;  // 来自网络，待拆壳
+  }
+}
+
+message StreamOut {
+  oneof payload {
+    WireFrame to_wire = 1; // 引擎产出，交 UDP 发送
+    TunPacket to_tun = 2;  // 引擎拆壳，交 TUN 写回
+  }
+}
+
+message Empty {}
+
+message TunnelStatus {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    IDLE = 1;
+    INITIATING = 2;
+    RESPONDING = 3;
+    ESTABLISHED = 4;
+  }
+  State state = 1;
+  uint64 send_epoch = 2;         // 当前发送密钥代（轮换诊断）
+  string local_addr_text = 3;    // 规范文本（protocol-spec §3.2）
+  string peer_addr_text = 4;
+  // 累计计数（单调不减，健康检查与丢包诊断用）
+  uint64 sealed_outbound = 5;    // 已封装发往网络的帧数
+  uint64 delivered_inbound = 6;  // 已拆壳写回 TUN 的帧数
+  uint64 dropped_inbound = 7;    // AEAD 失败/重放/旧代丢弃的帧数
+  // Phase 2 认证握手
+  bool authenticated = 8;        // 本隧道是否认证模式
+  string last_auth_error = 9;    // 最近一次认证失败原因（空 = 无）
+  // Phase 2 Fallback（v9 §11）
+  FallbackLevel fallback_level = 10; // 该对端当前降级级别（默认按主隧道）
+}
+
+// v9 §11 四级降级顺序
+enum FallbackLevel {
+  FALLBACK_LEVEL_UNSPECIFIED = 0;
+  MAIN_TUNNEL = 1;   // IPv8+ 隧道，主入口
+  ALT_TUNNEL = 2;    // IPv8+ 隧道，备用入口（级联）
+  PLAIN_TCP = 3;     // 明文 IPv4 TCP
+  PLAIN_UDP = 4;     // 明文 IPv4 UDP
+}
+
+enum FailureKind {
+  FAILURE_KIND_UNSPECIFIED = 0;
+  HANDSHAKE_TIMEOUT = 1;   // 隧道握手超时
+  FIRST_PACKET_TIMEOUT = 2; // 隧道已建但首包无响应（直接降级，不占重试预算）
+  LEVEL_FAILED = 3;         // 当前级彻底失败（拒连/不可达）
+}
+
+// Resolver 原子返回的入口信息（宿主查询后喂给引擎的降级状态机）
+message ResolvedEntry {
+  string tunnel_entry = 1;      // 主入口（host:port 文本，宿主解释）
+  repeated string alt_entries = 2; // 备用入口，按优先级
+  bool ipv8_capable = 3;        // 对端是否支持 IPv8+（false ⇒ 直接 PlainTcp）
+  string last_good_entry = 4;   // 上次成功握手入口（非空 ⇒ 握手用更短超时）
+}
+
+message SetResolvedRequest {
+  string peer = 1;              // 对端标识（通常为 peer_addr_text）
+  ResolvedEntry resolved = 2;
+}
+
+message NextPathRequest {
+  string peer = 1;
+}
+
+// 下一个包的发送路径决策。隧道级给出 entry，宿主据 resolver 映射到地址发包；
+// 明文级由宿主直用 TCP/UDP socket 传输（不经引擎封装）。
+message NextPathResponse {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    TUNNEL = 1;
+    PLAIN_TCP = 2;
+    PLAIN_UDP = 3;
+  }
+  Kind kind = 1;
+  string tunnel_entry = 2;         // TUNNEL 时的入口文本
+  uint32 handshake_timeout_secs = 3; // 本次握手应给的超时（分级：8/5）
+}
+
+message RecordFailureRequest {
+  string peer = 1;
+  FailureKind kind = 2;
+}
+
+message RecordSuccessRequest {
+  string peer = 1;
+  // 刚成功的实际入口；TUNNEL 时非空 ⇒ 备用提正、清降级缓存
+  string tunnel_entry = 2;
+}
+
+message FallbackLevelResponse {
+  FallbackLevel level = 1;
+}
+
+message StartHandshakeRequest {
+  string peer_addr_text = 1;     // Resolver 解析所得，规范文本
+}
+
+message StartHandshakeResponse {
+  WireFrame init_frame = 1;      // HandshakeInit 帧，C# 层负责 UDP 发出
+}
+
+message InjectFrameResponse {
+  // 需要发回对端的响应帧（HandshakeResp）；无响应时 raw 为空。
+  WireFrame response_frame = 1;
+  bool established = 2;          // 本次注入是否使隧道进入 Established
+}
+
+service TunnelEngine {
+  // 数据面双向泵
+  rpc StreamPackets(stream StreamIn) returns (stream StreamOut);
+
+  // 控制面
+  rpc StartHandshake(StartHandshakeRequest) returns (StartHandshakeResponse);
+  rpc InjectFrame(WireFrame) returns (InjectFrameResponse);
+  rpc GetStatus(Empty) returns (TunnelStatus);
+
+  // Fallback 决策面（v9 §11；状态机在引擎侧，IO/计时在宿主侧）
+  rpc SetResolved(SetResolvedRequest) returns (Empty);
+  rpc NextPath(NextPathRequest) returns (NextPathResponse);
+  rpc RecordFailure(RecordFailureRequest) returns (FallbackLevelResponse);
+  rpc RecordSuccess(RecordSuccessRequest) returns (FallbackLevelResponse);
+}

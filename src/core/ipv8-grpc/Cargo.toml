@@ -1,0 +1,24 @@
+[package]
+name = "ipv8-grpc"
+description = "gRPC(tonic) 桥：把 ipv8-tunnel::Engine 暴露为 tunnel.proto 定义的 TunnelEngine 服务"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+ipv8-codec = { workspace = true }
+ipv8-tunnel = { path = "../ipv8-tunnel" }
+tonic = { version = "0.12", features = ["transport"] }
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
+tokio-stream = "0.1"
+futures-core = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+protox = "0.7"
+prost-types = "0.13"
