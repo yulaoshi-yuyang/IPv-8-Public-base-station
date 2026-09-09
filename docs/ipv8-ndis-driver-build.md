@@ -1,5 +1,9 @@
 # IPv8 NDIS 协议驱动 — 构建与安装指南
 
+> **⚠️ 已归档（2026-09-09）**：ADR-024 否决内核数据面路线后，驱动源码已从
+> `src/driver/` 移至 `archive/ipv8-ndis-protocol/`。本文全部路径按归档位置理解，
+> 仅供未来复评或考古时重建使用，不属于主线构建面。
+
 ## 这是什么
 
 一个 NDIS 6.x 协议驱动，装完之后在网络适配器属性里会多出一个
@@ -27,7 +31,7 @@ wintun 方案。这个驱动的核心作用是 **UI 存在感 + 协议栈注册�
 
 **方法一：Visual Studio 打开**
 
-1. VS 2022 打开 `src/driver/ipv8-ndis-protocol/ipv8proto.vcxproj`
+1. VS 2022 打开 `archive/ipv8-ndis-protocol/ipv8proto.vcxproj`
 2. 配置选 `Release` / `x64`
 3. 菜单 → 生成 → 生成解决方案
 4. 输出在 `bin/x64/Release/ipv8proto.sys` + `ipv8proto.inf`
@@ -36,7 +40,7 @@ wintun 方案。这个驱动的核心作用是 **UI 存在感 + 协议栈注册�
 
 ```powershell
 # 打开 "x64 Native Tools Command Prompt for VS 2022"
-cd src\driver\ipv8-ndis-protocol
+cd archive\ipv8-ndis-protocol
 msbuild ipv8proto.vcxproj /p:Configuration=Release /p:Platform=x64
 ```
 
@@ -64,7 +68,7 @@ bcdedit /set testsigning on
 ```powershell
 # 管理员 PowerShell
 cd deploy\driver
-.\install-ipv8-protocol.ps1 -DriverPath "..\..\src\driver\ipv8-ndis-protocol\bin\x64\Release"
+.\install-ipv8-protocol.ps1 -DriverPath "..\..\archive\ipv8-ndis-protocol\bin\x64\Release"
 ```
 
 ### 4. 验证
@@ -114,7 +118,7 @@ IPv8 作为一个 overlay 协议，它的地址不会显示在物理网卡的属
 ## 文件清单
 
 ```
-src/driver/ipv8-ndis-protocol/
+archive/ipv8-ndis-protocol/
 ├── ipv8proto.inf        ← 安装信息文件（控制显示名称、图标、绑定方式）
 ├── ipv8proto.vcxproj    ← VS 项目文件
 ├── driver.h             ← 驱动头文件

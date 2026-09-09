@@ -5,6 +5,17 @@
 
 ## [Unreleased]
 
+### 工程化（2026-09-09）
+- 建立 git 仓库（初始提交含 140 文件），`.gitignore` 排除 exe/zip/工具二进制与一次性分享产物
+- `scripts/make-peer-pack.ps1`：跨机验证包（`deploy/cross-verify/` + zip）唯一再生成入口，禁止手工复制 exe
+- `verify-loopback.ps1` / `verify-cross.ps1` / `notun-selftest.ps1`：加构建新鲜度护栏，自检默认优先 `target\release` 现建产物
+- `docs/adr/README.md`：ADR 索引，含编号缺口（001-006 等在 v9 方案文档阶段）说明
+- NDIS 协议驱动源码归档至 `archive/ipv8-ndis-protocol/`（ADR-024 否决内核路线），相关构建文档与安装脚本路径同步
+- `性能评分报告.html` v2：回填双套件实测（引擎 AES-256-GCM 7.5 Gbps vs ChaCha 3.6 Gbps），总分 88 → 92
+
+### 性能
+- `bench_dataplane.rs` 扩为 ChaCha20-Poly1305 / AES-256-GCM 双套件对比：AEAD seal 0.55 → 1.03 GiB/s，引擎单程 0.40 → 0.85 GiB/s（i9-13900H 单线程 release）
+
 ### 项目结构重构
 - 将项目主体从 `Strata/` 子目录提升到根目录，消除多余嵌套层级
 - 整理文档结构：工程化方案 PDF/TXT 归集到 `docs/references/`，spec 归属分析移入 `docs/`

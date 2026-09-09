@@ -7,8 +7,10 @@ $ErrorActionPreference = "Stop"
 $scriptDir = $PSScriptRoot
 $projectRoot = Split-Path $scriptDir -Parent          # -> deploy
 $projectRoot = Split-Path $projectRoot -Parent          # -> project root
-$srcSys = Join-Path $projectRoot "src\driver\ipv8-ndis-protocol\bin\x64\Release\ipv8proto.sys"
-$srcInf = Join-Path $projectRoot "src\driver\ipv8-ndis-protocol\bin\x64\Release\ipv8proto.inf"
+# NOTE: driver source archived to archive\ipv8-ndis-protocol (ADR-024: kernel
+# data plane rejected). This script is kept only for forensic/rebuild use.
+$srcSys = Join-Path $projectRoot "archive\ipv8-ndis-protocol\bin\x64\Release\ipv8proto.sys"
+$srcInf = Join-Path $projectRoot "archive\ipv8-ndis-protocol\bin\x64\Release\ipv8proto.inf"
 
 # Use ASCII-only temp path
 $staging = Join-Path $env:TEMP "IPv8Driver"
