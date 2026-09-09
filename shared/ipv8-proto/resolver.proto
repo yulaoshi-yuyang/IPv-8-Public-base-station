@@ -13,6 +13,10 @@ service Resolver {
   rpc Resolve(ResolveRequest) returns (ResolveResponse);
   // 节点登记自己的隧道入口（注册后域名才可解析；PoP 语义与 ZoneServer 同源）
   rpc Register(RegisterRequest) returns (RegisterResponse);
+  // ADR-026 级 2：打洞会合（信令）。双方各自调用一次：上报自己 → 服务端
+  // 记录所见源地址（STUN 的 observed），并返回对端候选地址集。
+  // 鉴权 = 已登记身份（存储的 ed_pub 验 PoP），匿名者拿不到 observed（ADR-007 收紧）。
+  rpc Rendezvous(RendezvousRequest) returns (RendezvousResponse);
 }
 
 message ResolveRequest {
@@ -46,4 +50,25 @@ message RegisterRequest {
 
 message RegisterResponse {
   uint32 ttl = 1;               // 实际生效 TTL（服务端可能下调）
+  // ADR-026：服务端在登记连接上"看到你"的源地址（NAT 映射后公网 "ip:port"）。
+  // 回显给节点自检（本机猜的出口 vs 真实出口）；同时存入条目供会合使用。
+  string observed_addr = 2;
+}
+
+// —— ADR-026 级 2：NAT 打洞会合（STUN 观察 + 信令交换，复用 Resolver 通道）——
+
+message RendezvousRequest {
+  string addr_text = 1;         // 本端 IPv8+ 地址（canonical 32hex，必须已登记）
+  bytes  proof = 2;             // PoP：登记公钥对应私钥对
+                                //   ("ipv8plus-rendezvous" ‖ addr_text ‖ peer_addr_text)
+                                //   的签名——域分隔防挪用；绑定 peer 防一次签名换目标复用
+  string peer_addr_text = 3;    // 要与之建隧道的对端地址
+  repeated string local_candidates = 4; // 本端自报候选（LAN/接口地址，可空；仅信息性，
+                                        // 权威候选是服务端 observed——自报可能是伪冒）
+}
+
+message RendezvousResponse {
+  repeated string peer_candidates = 1; // 对端候选："服务端所见源地址(未过期)" ∪ 对端自报
+  string self_observed = 2;            // 服务端所见本端源地址（诊断回显）
+  uint32 ttl = 3;                      // 候选有效期（秒，短——NAT 映射会漂移）
 }

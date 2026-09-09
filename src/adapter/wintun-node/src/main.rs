@@ -191,7 +191,7 @@ struct Config {
     /// 启用打洞编排（必须配 --resolver 与 --ed-seed）。
     /// --peer-ip 变成占位（决定 socket 绑定族：候选是 v6 就填任意 v6）。
     punch: bool,
-    /// ADR-026 性能线：Data 面流级分片 worker 数（--shards N，默认 1 = 单点
+    /// ADR-024 用户态性能线：Data 面流级分片 worker 数（--shards N，默认 1 = 单点
     /// 零回归）。Established 后自动拆分，同流同 worker 保 nonce 唯一。
     /// 仅真实 TUN 路径生效；--no-tun 回显验证件恒用单点引擎。
     /// 两端必须一致（部署配置，同 ADR-025 套件哲学）。
@@ -219,7 +219,7 @@ fn usage() -> ! {
          \x20\x20 # ADR-026 级 2 打洞：向 Resolver 登记+会合，取对端 observed 候选撞洞\n\
          \x20\x20 # （--peer-ip 占位定绑定族；应答方自动现学回程地址）\n\
          [--shards N]\n\
-         \x20\x20 # ADR-026 性能线：Data 面流级分片 worker 数（1..=64，默认 1=单点）。\n\
+         \x20\x20 # ADR-024 用户态性能线：Data 面流级分片 worker 数（1..=64，默认 1=单点）。\n\
          \x20\x20 # Established 后自动拆分并行加解密；两端必须取相同 N（错配=丢包非错交付）\n\
          拓扑: 恰好一端 --initiate（主动），另一端被动等待 Init\n\
          示例(A 机主动): ipv8-node --self 0000fb14000000010001000001000000 \\\n\

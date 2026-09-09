@@ -187,13 +187,13 @@
   <div class="header">
     <h1>IPv8+ 性能评分报告</h1>
     <div class="subtitle">协议引擎 · 代码质量 · 功能完整度 · 工程化水平</div>
-    <div class="date">评估日期：2026-09-09（v3 · 回填流级分片多核实测与 C# 集成测试扩展）｜ 基线硬件：i9-13900H / 16GB RAM / Windows 11</div>
+    <div class="date">评估日期：2026-09-09（v4 · 回填跨机公网 v6 直连 PASS + ADR-026 级 2/3 冒烟）｜ 基线硬件：i9-13900H / 16GB RAM / Windows 11</div>
   </div>
 
   <!-- 总分 -->
   <div class="total-score">
-    <div class="score">93</div>
-    <div class="label">综合评分 / 100</div>
+    <div class="score">95</div>
+    <div class="label">综合评分 / 100（初版 88 · v3 93）</div>
     <div class="grade">★ 优秀（A）</div>
   </div>
 
@@ -224,7 +224,7 @@
         <div class="progress-fill excellent" style="width: 96%"></div>
       </div>
       <ul class="metric-list">
-        <li><span class="metric-name">Rust 测试数</span><span class="metric-val">227 项</span></li>
+        <li><span class="metric-name">Rust 测试数</span><span class="metric-val">230 项</span></li>
         <li><span class="metric-name">C# 测试通过率</span><span class="metric-val pass">36/36 (100%)</span></li>
         <li><span class="metric-name">构建警告</span><span class="metric-val pass">0</span></li>
         <li><span class="metric-name">Clippy 警告</span><span class="metric-val pass">0</span></li>
@@ -234,16 +234,16 @@
     <div class="dim-card">
       <div class="dim-header">
         <span class="dim-title">功能完整度</span>
-        <span class="dim-score">22<span class="out-of"> / 25</span></span>
+        <span class="dim-score">24<span class="out-of"> / 25</span></span>
       </div>
       <div class="progress-bar">
-        <div class="progress-fill good" style="width: 88%"></div>
+        <div class="progress-fill excellent" style="width: 96%"></div>
       </div>
       <ul class="metric-list">
         <li><span class="metric-name">Phase 1-5 完成</span><span class="metric-val pass">5/5 (100%)</span></li>
-        <li><span class="metric-name">ADR 数量</span><span class="metric-val">9 篇</span></li>
-        <li><span class="metric-name">跨机真网验证</span><span class="metric-val warn">待实测</span></li>
-        <li><span class="metric-name">AES-256-GCM 套件</span><span class="metric-val pass">已落地+实测</span></li>
+        <li><span class="metric-name">跨机真网验证（公网 v6 直连）</span><span class="metric-val pass">PASS 09-09</span></li>
+        <li><span class="metric-name">ADR 数量（含 026 穿透提案）</span><span class="metric-val">10 篇</span></li>
+        <li><span class="metric-name">跨机带真实 wintun 网卡</span><span class="metric-val warn">待实测</span></li>
       </ul>
     </div>
 
@@ -391,27 +391,63 @@
     </table>
   </div>
 
+  <!-- 跨机真网验证（v4 回填） -->
+  <div class="section">
+    <h2>三、跨机真网与 ADR-026 验证记录（2026-09-09 回填）</h2>
+    <h3>3.1 双机公网 IPv6 直连（verify-cross · A/B · LearnPeer + NoTun）</h3>
+    <p class="val-note" style="margin-bottom:8px;">拓扑：本机（移动热点 v6 · 2409:8938:…）↔ 第二机（移动家宽 v6 · 2409:8a38:…），跨公网真实 UDP，证书认证握手，合成回显载荷。</p>
+    <table>
+      <thead><tr><th>指标</th><th>实测值</th><th>状态</th></tr></thead>
+      <tbody>
+        <tr><td>预检 ICMPv6 可达</td><td>2/2 回复 · RTT 35~60 ms</td><td class="val-good">PASS</td></tr>
+        <tr><td>隧道握手</td><td>A/B 双端 Established（认证）</td><td class="val-good">PASS</td></tr>
+        <tr><td>数据面对账</td><td>sealed +2 · delivered +2 · dropped 0</td><td class="val-good">PASS</td></tr>
+        <tr><td>回显完整性</td><td>ECHO_OK +2 · ECHO_BAD +0（64B 逐字节一致）</td><td class="val-good">PASS</td></tr>
+      </tbody>
+    </table>
+    <p class="val-note" style="margin-top:10px;">同轮修复 verify-cross.ps1 预检缺陷（IPv6 回复无 TTL 字段致恒误报，改 Test-Connection 对象判定）并落地端口占用防呆（10048 前先报占用者 PID）。遗留：跨机带真实 wintun 网卡（去 -NoTun）与 -Fragment/-Zone 跨机形态待对端驱动放行后回填。</p>
+    <h3>3.2 ADR-026 级 2 · 打洞会合（punch-smoke.ps1，同机三方）</h3>
+    <table>
+      <thead><tr><th>验证点</th><th>实测</th><th>状态</th></tr></thead>
+      <tbody>
+        <tr><td>Resolver observed 观察/回显 + 组合候选优先</td><td>登记回显源地址；候选 ["127.0.0.1:45703", …] 组合首位</td><td class="val-good">PASS</td></tr>
+        <tr><td>死端口静态入口 → 仅靠会合建链</td><td>Established + ECHO_OK×2（编排正确性证据）</td><td class="val-good">PASS</td></tr>
+      </tbody>
+    </table>
+    <h3>3.3 ADR-026 级 3 · 双向中继（relay-smoke.ps1，同机三方）</h3>
+    <table>
+      <thead><tr><th>验证点</th><th>实测</th><th>状态</th></tr></thead>
+      <tbody>
+        <tr><td>注册鉴权（RPT0 ‖ addr ‖ cert，CA 三验 + 主体一致）</td><td>双端登记；伪造/错配被拒（rejected 计数）</td><td class="val-good">PASS</td></tr>
+        <tr><td>明文路由头查表转发（密文零信任搬运）</td><td>registered=2 · forwarded=8 · noroute=0</td><td class="val-good">PASS</td></tr>
+        <tr><td>跨中继隧道与回显</td><td>Established · ECHO_OK #1..#3（64B 逐字节）· relay 单测 3 项</td><td class="val-good">PASS</td></tr>
+      </tbody>
+    </table>
+  </div>
+
   <!-- C# 侧测试 -->
   <div class="section">
-    <h2>三、C# 服务层测试结果（Release 构建）</h2>
+    <h2>四、C# 服务层测试结果（Release 构建）</h2>
     <table>
       <thead>
         <tr><th>测试组</th><th>通过数</th><th>总数</th><th>状态</th></tr>
       </thead>
       <tbody>
-        <tr><td>TUN Adapter 契约</td><td>2</td><td>2</td><td class="val-good">PASS</td></tr>
-        <tr><td>配置绑定</td><td>2</td><td>2</td><td class="val-good">PASS</td></tr>
-        <tr><td>QoS 调度</td><td>2</td><td>2</td><td class="val-good">PASS</td></tr>
-        <tr><td>ANS 寻址与编排</td><td>7</td><td>7</td><td class="val-good">PASS</td></tr>
-        <tr><td><strong>合计</strong></td><td><strong>13</strong></td><td><strong>13</strong></td><td class="val-good"><strong>100%</strong></td></tr>
+        <tr><td>TUN Adapter 契约（含生命周期）</td><td>3</td><td>3</td><td class="val-good">PASS</td></tr>
+        <tr><td>配置绑定（含默认值保持）</td><td>3</td><td>3</td><td class="val-good">PASS</td></tr>
+        <tr><td>QoS 调度（含并发守恒/钳位/出队序）</td><td>7</td><td>7</td><td class="val-good">PASS</td></tr>
+        <tr><td>ANS 寻址与编排（含租约生命周期/消毒）</td><td>13</td><td>13</td><td class="val-good">PASS</td></tr>
+        <tr><td>NRPT 清理服务（缺脚本空停/真实调用）</td><td>3</td><td>3</td><td class="val-good">PASS</td></tr>
+        <tr><td>tunnel.proto 契约形状 + 事件契约</td><td>7</td><td>7</td><td class="val-good">PASS</td></tr>
+        <tr><td><strong>合计</strong></td><td><strong>36</strong></td><td><strong>36</strong></td><td class="val-good"><strong>100%</strong></td></tr>
       </tbody>
     </table>
-    <p class="val-note" style="margin-top: 12px;">构建：0 警告 0 错误 ｜ 共享向量测试（Rust↔C# 双侧语义一致）：PASS</p>
+    <p class="val-note" style="margin-top: 12px;">构建：0 警告 0 错误（TreatWarningsAsErrors）｜ 共享向量测试（Rust↔C# 双侧语义一致）：PASS ｜ 连续 5 次复跑稳定全绿。gRPC 真桥接集成仍受 NuGet 未解禁限制。</p>
   </div>
 
   <!-- 评分维度说明 -->
   <div class="section">
-    <h2>四、评分维度说明</h2>
+    <h2>五、评分维度说明</h2>
     <table>
       <thead>
         <tr><th>维度</th><th>权重</th><th>得分</th><th>扣分原因</th></tr>
@@ -432,8 +468,8 @@
         <tr>
           <td>功能完整度</td>
           <td>25%</td>
-          <td>22 / 25</td>
-          <td>跨机真网验证待回填（-2）；内核优化按 ADR-024 止步用户态（-1）</td>
+          <td>24 / 25</td>
+          <td>跨机真网验证已回填（公网 v6 直连双端 PASS，含逐字节回显）；ADR-026 级 2/3 同机冒烟 PASS。保留 -1：跨机带真实 wintun 网卡全链路（-Fragment / -Zone 跨机形态）待第二台机器驱动放行后回填</td>
         </tr>
         <tr>
           <td>工程化水平</td>
@@ -447,18 +483,18 @@
 
   <!-- 改进建议 -->
   <div class="section">
-    <h2>五、下一步优化建议</h2>
+    <h2>六、下一步优化建议</h2>
     <ol class="suggestions">
       <li><strong>✅ 已完成：启用 AES-256-GCM 套件并实测</strong><br>ADR-025 双套件已落地，本轮 bench 实测确认 AES-NI 使引擎单程吞吐 3.6 → 7.5 Gbps。生产部署通过 Engine::set_cipher_suite 在握手前启用；默认仍保持 ChaCha 以兼容 Phase 1-4 线上格式。</li>
       <li><strong>✅ 已完成：流级多核扩展（ADR-024 用户态性能线）</strong><br>FlowShards N-worker 数据面 + epoch 同余路由 + ipv8-node --shards 接线；实测 AES 4 分片 10.0 Gbps / 8 分片 10.9 Gbps。剩余：真机端到端（TUN+UDP 多核）吞吐回填与 n>4 平台期的搬运侧优化。</li>
       <li><strong>✅ 大部分完成：C# 测试扩至 36 项</strong><br>新增 NRPT 真实脚本执行（绝对/相对路径）、QoS 并发守恒/无重无失、AgentMesh 同名共存/多标签排序、tunnel.proto 冻结面、MockTun 生命周期。gRPC 真桥接集成仍受 NuGet 未解禁限制；环境解锁后补 StreamPackets 端到端。</li>
       <li><strong>推送远端仓库，激活 CI</strong><br>本地 git 仓库已建立。推送到 GitHub/Gitee 后 .github/workflows/ci.yml 即接管 clippy -D warnings + cargo test + dotnet build/test 门禁，杜绝质量回退。</li>
-      <li><strong>补跨机真网实测数据</strong><br>同机回环已全绿；本机 WLAN 当前无公网入口（v4 NAT + 无 v6 GUA），跨机直连需换网络环境或走 WS 中转链路回填。找两台可达机器跑 verify-cross.ps1，补 RTT、丢包率、吞吐（含 --shards 对照）。</li>
+      <li><strong>✅ 已完成（v4 回填）：跨机真网实测</strong><br>两台真机跨公网 IPv6 直连 PASS（LearnPeer+NoTun，Established / dropped=0 / ECHO_OK 逐字节，详见第三节 3.1）。剩余：①带真实 wintun 网卡的跨机全链路（去 -NoTun，需对端驱动放行）；②-Fragment / -Zone 跨机形态；③打洞（级 2）真机实测——需公网可达的 Resolver（小 VPS 即可），打样数据决定对称 NAT 失败率与中继容量规划，回填 ADR-026 未决项。</li>
     </ol>
   </div>
 
   <div class="footer">
-    IPv8+ 性能评分报告 · v3 · 更新于 2026-09-09 · 基于 Phase 5 完成 + AES-256-GCM 实测 + 流级分片多核 + git 初始化后状态评估
+    IPv8+ 性能评分报告 · v4 · 更新于 2026-09-09（深夜） · 基于 Phase 5 完成 + AES/流级分片实测 + 跨机公网 v6 直连 PASS + ADR-026 级 2/3 冒烟状态评估
   </div>
 </div>
 </body>

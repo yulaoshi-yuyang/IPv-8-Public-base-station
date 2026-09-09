@@ -8,6 +8,6 @@ description = "Cloudflare WebSocket 桥：把原生 AEAD 隧道端点经 WS 暴�
 [dependencies]
 ipv8-tunnel = { path = "../../core/ipv8-tunnel" }
 ipv8-codec = { path = "../../core/ipv8-codec" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"

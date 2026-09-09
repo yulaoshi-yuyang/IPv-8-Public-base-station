@@ -208,16 +208,53 @@ try {
     }
     Report "[cross] role=$Role  self-tun=$tunSelf  peer=$PeerIp (tun $tunPeer)  udp=$UdpPort"
 
+    # Port pre-flight: the stale-process cleanup above cannot kill elevated
+    # (RunAs) leftovers when this run is non-elevated - the node then dies with
+    # a bare "10048 AddrInUse" and no clue who holds the port (hit 2x on
+    # 2026-09-09). Detect the owner HERE and name it + the exact fix. Degrades
+    # silently on hosts where the cmdlet is unavailable (falls back to 10048).
+    $portGuard = $true
+    try { $null = Get-Command Get-NetUDPEndpoint -ErrorAction Stop } catch { $portGuard = $false }
+    if ($portGuard) {
+        foreach ($spec in @(
+            @{ Port = $UdpPort;  Proto = 'UDP'; Conn = { Get-NetUDPEndpoint -LocalPort $UdpPort -ErrorAction SilentlyContinue } },
+            @{ Port = $ZonePort; Proto = 'TCP'; Conn = { Get-NetTCPConnection -LocalPort $ZonePort -State Listen -ErrorAction SilentlyContinue } }
+        )) {
+            if ($spec.Proto -eq 'TCP' -and -not ($Zone -and $Role -eq $ZoneHost)) { continue }
+            foreach ($ep in @(& $spec.Conn)) {
+                $op = $ep.OwningProcess
+                if (-not $op) { continue }
+                $oname = (Get-Process -Id $op -ErrorAction SilentlyContinue).ProcessName
+                if (-not $oname) { $oname = 'unknown' }
+                if ($oname -like 'ipv8*') {
+                    throw "$($spec.Proto) port $($spec.Port) is still held by a leftover $oname (PID $op). That process was started elevated, so this run cannot stop it. Fix: run this same command ONCE from an 'Run as administrator' PowerShell (auto-cleanup), or kill it directly: taskkill /PID $op /F"
+                }
+                throw "$($spec.Proto) port $($spec.Port) is in use by '$oname' (PID $op), which is not an ipv8 process. Close that app, or re-run with a different -UdpPort (currently $UdpPort)."
+            }
+        }
+        Report "[cross] port pre-flight OK: UDP $UdpPort free"
+    }
+
     # Pre-flight (initiator only): do we even have a route to the peer family?
     # Catches "no IPv6 egress" (WSAENETUNREACH/10051) before wasting a run.
+    # NOTE: must NOT grep ping stdout for 'TTL=' - IPv6 echo replies carry no
+    # TTL field at all, so the old check could never pass on v6 (false FAIL
+    # observed 2026-09-09 with working 35ms v6 connectivity). Test-Connection
+    # returns objects: locale/codepage proof; StatusCode 0 = real reply.
     if ($Role -eq 'A') {
-        $probe = & ping -n 2 -w 1500 $PeerIp
-        $pr = @($probe | Select-String -Pattern 'TTL=').Count
+        $replies = @(Test-Connection -ComputerName $PeerIp -Count 2 -ErrorAction SilentlyContinue |
+                     Where-Object { $_.StatusCode -eq 0 })
+        $pr = $replies.Count
+        if ($pr -eq 0) {
+            # fallback: native ping exit code (0 = at least one reply)
+            $null = & ping -6 -n 2 -w 1500 $PeerIp
+            if ($LASTEXITCODE -eq 0) { $pr = 1 }
+        }
         if ($pr -eq 0) {
             $why = if ($peerIsV6) { 'this host has no working IPv6 route to that address (run: ping -6 ' + $PeerIp + ' to confirm)' } else { 'that IPv4 is unreachable from this host' }
             throw "pre-flight failed: cannot reach peer $PeerIp - $why. Fix connectivity first (enable IPv6 on this machine, or use a reachable address family)."
         }
-        Report "[cross] pre-flight OK: peer reachable via ping ($pr/2 replies)"
+        Report "[cross] pre-flight OK: peer reachable ($pr/2 ICMP replies)"
     }
 
     $argList = @('--self', $addrSelf, '--peer-addr', $addrPeer, '--peer-ip', $PeerIp,

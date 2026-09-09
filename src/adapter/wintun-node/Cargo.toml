@@ -14,6 +14,7 @@ ipv8-codec = { workspace = true }
 ipv8-tunnel = { path = "../../core/ipv8-tunnel" }
 ipv8-grpc = { path = "../../core/ipv8-grpc" }
 ipv8-zoneserver = { path = "../../cloud/zoneserver" }
+ipv8-resolver = { path = "../../cloud/resolver" }
 wintun = "0.5.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
 tokio-stream = "0.1"
