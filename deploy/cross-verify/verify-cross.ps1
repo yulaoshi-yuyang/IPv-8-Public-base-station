@@ -139,6 +139,17 @@ $exe   = Join-Path $PSScriptRoot 'ipv8-node.exe'
 $zexe  = Join-Path $PSScriptRoot 'ipv8-zoneserver.exe'
 $dll   = Join-Path $PSScriptRoot 'wintun.dll'
 
+# Staleness guard: if this pack sits inside the repo and a newer build exists
+# under target\release, warn that we are about to verify an OLD binary. On a
+# peer machine (no repo) the pack itself is the source of truth.
+$_repoRel = Join-Path (Split-Path $PSScriptRoot -Parent) 'target\release\ipv8-node.exe'
+if ((Test-Path $_repoRel) -and (Test-Path $exe)) {
+    if ((Get-Item $_repoRel).LastWriteTime -gt (Get-Item $exe).LastWriteTime) {
+        Write-Host "[cross] WARNING: pack exe at $exe is OLDER than $_repoRel"
+        Write-Host "[cross]          rebuild the pack: powershell -File scripts\make-peer-pack.ps1"
+    }
+}
+
 # Identity plan (same ASN/64500 family as loopback; host octet = role)
 $addrSelf = if ($Role -eq 'A') { '0000fb140000000a0001000001000000' } else { '0000fb140000000b0001000001000000' }
 $addrPeer = if ($Role -eq 'A') { '0000fb140000000b0001000001000000' } else { '0000fb140000000a0001000001000000' }

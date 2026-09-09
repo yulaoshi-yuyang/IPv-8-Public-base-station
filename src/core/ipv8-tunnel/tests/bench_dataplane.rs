@@ -15,7 +15,7 @@ use std::time::Instant;
 use ed25519_dalek::{Signer, Verifier};
 use ipv8_codec::{encode, fragment_packet, IPv8Address, IPv8Header, Reassembler, RouteTrace};
 use ipv8_routing::build_route_trace;
-use ipv8_tunnel::crypto::{Identity, TunnelKeys};
+use ipv8_tunnel::crypto::{CipherSuite, Identity, TunnelKeys};
 use ipv8_tunnel::{Engine, State};
 
 fn gib_per_s(bytes: u64, secs: f64) -> f64 {
@@ -31,29 +31,32 @@ fn aead_seal_and_roundtrip_throughput() {
     let hdr = [0x45u8; 40]; // 充当明文头（AAD）
     let secret = vec![0xA5u8; PAYLOAD];
 
-    // 纯 seal 吞吐（同一密钥对象连发，counter 递增无回绕成本）
-    let mut tx = TunnelKeys::new([7u8; 32], true);
-    let t = Instant::now();
-    for _ in 0..ROUNDS {
-        tx.seal(&hdr, &secret);
-    }
-    let seal_s = t.elapsed().as_secs_f64();
+    for suite in [CipherSuite::ChaCha20Poly1305, CipherSuite::Aes256Gcm] {
+        // 纯 seal 吞吐（同一密钥对象连发，counter 递增无回绕成本）
+        let mut tx = TunnelKeys::with_suite([7u8; 32], true, suite);
+        let t = Instant::now();
+        for _ in 0..ROUNDS {
+            tx.seal(&hdr, &secret);
+        }
+        let seal_s = t.elapsed().as_secs_f64();
 
-    // seal→open 新鲜往返（每轮新帧，counter 单调，replay 路径零干扰）
-    let mut tx2 = TunnelKeys::new([8u8; 32], true);
-    let mut rx2 = TunnelKeys::new([8u8; 32], false);
-    let t = Instant::now();
-    for _ in 0..ROUNDS {
-        let (kid, body) = tx2.seal(&hdr, &secret);
-        rx2.open(&kid, &body, &hdr).expect("新鲜帧必须可解");
+        // seal→open 新鲜往返（每轮新帧，counter 单调，replay 路径零干扰）
+        let mut tx2 = TunnelKeys::with_suite([8u8; 32], true, suite);
+        let mut rx2 = TunnelKeys::with_suite([8u8; 32], false, suite);
+        let t = Instant::now();
+        for _ in 0..ROUNDS {
+            let (kid, body) = tx2.seal(&hdr, &secret);
+            rx2.open(&kid, &body, &hdr).expect("新鲜帧必须可解");
+        }
+        let rt_s = t.elapsed().as_secs_f64();
+        println!(
+            "[bench] AEAD({:?}) seal {:.2} GiB/s | seal+open 往返 {:.2} GiB/s（payload {}B，单线程）",
+            suite,
+            gib_per_s(ROUNDS * PAYLOAD as u64, seal_s),
+            gib_per_s(ROUNDS * PAYLOAD as u64, rt_s),
+            PAYLOAD
+        );
     }
-    let rt_s = t.elapsed().as_secs_f64();
-    println!(
-        "[bench] AEAD seal {:.2} GiB/s | seal+open 往返 {:.2} GiB/s（payload {}B，单线程）",
-        gib_per_s(ROUNDS * PAYLOAD as u64, seal_s),
-        gib_per_s(ROUNDS * PAYLOAD as u64, rt_s),
-        PAYLOAD
-    );
 }
 
 #[test]
@@ -149,30 +152,36 @@ fn routetrace_build_verify_cost() {
 #[ignore]
 fn engine_loopback_data_plane() {
     // 纯引擎回环（明文握手，无 socket 无 TUN）：seal→handle 单程成本
-    let mut alice = Engine::new(
-        Identity::from_bytes([1u8; 32]),
-        IPv8Address::new(1, 1, 0, 0, 0),
-        IPv8Address::new(1, 2, 0, 0, 0),
-    );
-    let mut bob = Engine::new(
-        Identity::from_bytes([2u8; 32]),
-        IPv8Address::new(1, 2, 0, 0, 0),
-        IPv8Address::new(1, 1, 0, 0, 0),
-    );
-    let resp = bob.handle_frame(&alice.start_handshake()).unwrap();
-    alice.handle_frame(&resp);
-    assert_eq!(alice.state(), State::Established);
-    let inner: Vec<u8> = (0..PAYLOAD as u8).collect();
-    let t = Instant::now();
-    for _ in 0..ROUNDS {
-        let f = alice.seal_frame(&inner).unwrap();
-        bob.handle_frame(&f);
-        let _ = bob.take_delivered();
+    for suite in [CipherSuite::ChaCha20Poly1305, CipherSuite::Aes256Gcm] {
+        let mut alice = Engine::new(
+            Identity::from_bytes([1u8; 32]),
+            IPv8Address::new(1, 1, 0, 0, 0),
+            IPv8Address::new(1, 2, 0, 0, 0),
+        );
+        let mut bob = Engine::new(
+            Identity::from_bytes([2u8; 32]),
+            IPv8Address::new(1, 2, 0, 0, 0),
+            IPv8Address::new(1, 1, 0, 0, 0),
+        );
+        alice.set_cipher_suite(suite);
+        bob.set_cipher_suite(suite);
+        let resp = bob.handle_frame(&alice.start_handshake()).unwrap();
+        alice.handle_frame(&resp);
+        assert_eq!(alice.state(), State::Established);
+        let inner: Vec<u8> = (0..PAYLOAD as u8).collect();
+        let t = Instant::now();
+        for _ in 0..ROUNDS {
+            let f = alice.seal_frame(&inner).unwrap();
+            bob.handle_frame(&f);
+            let _ = bob.take_delivered();
+        }
+        let s = t.elapsed().as_secs_f64();
+        println!(
+            "[bench] 引擎单程 seal→handle({:?}) {:.2} Mpps | {:.2} GiB/s ≈ {:.1} Gbps（纯引擎，不含 socket/TUN/wintun）",
+            suite,
+            ROUNDS as f64 / s / 1e6,
+            gib_per_s(ROUNDS * PAYLOAD as u64, s),
+            ROUNDS as f64 / s * 1432.0 * 8.0 / 1e9
+        );
     }
-    let s = t.elapsed().as_secs_f64();
-    println!(
-        "[bench] 引擎单程 seal→handle {:.2} Mpps | {:.2} GiB/s（纯引擎，不含 socket/TUN/wintun）",
-        ROUNDS as f64 / s / 1e6,
-        gib_per_s(ROUNDS * PAYLOAD as u64, s)
-    );
 }

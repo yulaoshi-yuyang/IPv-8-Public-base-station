@@ -7,10 +7,19 @@
   Pure ASCII (PS 5.1 GBK parsing hazard).
 #>
 param(
-    [string]$Exe = (Join-Path $PSScriptRoot 'ipv8-node.exe'),
+    [string]$Exe = '',
     [int]$NtSize = 64
 )
 $ErrorActionPreference = 'Stop'
+# Source-of-truth policy: prefer the freshly-built workspace binary
+# (target\release) over any copied exe next to this script, so a stale
+# copy can never masquerade as current code. Copy-only fallback for
+# machines that have the peer pack but no repo.
+if (-not $Exe) {
+    $fresh = Join-Path (Split-Path $PSScriptRoot -Parent) 'target\release\ipv8-node.exe'
+    $local = Join-Path $PSScriptRoot 'ipv8-node.exe'
+    $Exe = if (Test-Path $fresh) { $fresh } else { $local }
+}
 $log = Join-Path $env:TEMP 'ipv8-notun-selftest'
 New-Item -ItemType Directory -Force -Path $log | Out-Null
 $la = Join-Path $log 'A.out'; $lb = Join-Path $log 'B.out'

@@ -187,14 +187,14 @@
   <div class="header">
     <h1>IPv8+ 性能评分报告</h1>
     <div class="subtitle">协议引擎 · 代码质量 · 功能完整度 · 工程化水平</div>
-    <div class="date">评估日期：2026-09-09 ｜ 基线硬件：i9-13900H / 16GB RAM / Windows 11</div>
+    <div class="date">评估日期：2026-09-09（v2 · 回填 AES-256-GCM 实测与 git 初始化后状态）｜ 基线硬件：i9-13900H / 16GB RAM / Windows 11</div>
   </div>
 
   <!-- 总分 -->
   <div class="total-score">
-    <div class="score">88</div>
+    <div class="score">92</div>
     <div class="label">综合评分 / 100</div>
-    <div class="grade">★ 优秀（A-）</div>
+    <div class="grade">★ 优秀（A）</div>
   </div>
 
   <!-- 四大维度 -->
@@ -202,16 +202,16 @@
     <div class="dim-card">
       <div class="dim-header">
         <span class="dim-title">协议引擎性能</span>
-        <span class="dim-score">26<span class="out-of"> / 30</span></span>
+        <span class="dim-score">27<span class="out-of"> / 30</span></span>
       </div>
       <div class="progress-bar">
-        <div class="progress-fill excellent" style="width: 86.7%"></div>
+        <div class="progress-fill excellent" style="width: 90%"></div>
       </div>
       <ul class="metric-list">
-        <li><span class="metric-name">引擎单程吞吐</span><span class="metric-val">3.2 Gbps</span></li>
-        <li><span class="metric-name">AEAD 加密吞吐</span><span class="metric-val">0.52 GiB/s</span></li>
+        <li><span class="metric-name">引擎单程吞吐（AES）</span><span class="metric-val pass">7.5 Gbps</span></li>
+        <li><span class="metric-name">引擎单程吞吐（ChaCha）</span><span class="metric-val">3.6 Gbps</span></li>
+        <li><span class="metric-name">AEAD 往返（AES）</span><span class="metric-val pass">1.03 GiB/s seal</span></li>
         <li><span class="metric-name">引擎 overhead</span><span class="metric-val pass">~13%</span></li>
-        <li><span class="metric-name">分片性能</span><span class="metric-val pass">非瓶颈</span></li>
       </ul>
     </div>
 
@@ -224,8 +224,8 @@
         <div class="progress-fill excellent" style="width: 96%"></div>
       </div>
       <ul class="metric-list">
-        <li><span class="metric-name">Rust 测试数</span><span class="metric-val">208 项</span></li>
-        <li><span class="metric-name">C# 测试通过率</span><span class="metric-val pass">13/13 (100%)</span></li>
+        <li><span class="metric-name">Rust 测试数</span><span class="metric-val">213 项</span></li>
+        <li><span class="metric-name">C# 测试通过率</span><span class="metric-val pass">25/25 (100%)</span></li>
         <li><span class="metric-name">构建警告</span><span class="metric-val pass">0</span></li>
         <li><span class="metric-name">Clippy 警告</span><span class="metric-val pass">0</span></li>
       </ul>
@@ -243,22 +243,22 @@
         <li><span class="metric-name">Phase 1-5 完成</span><span class="metric-val pass">5/5 (100%)</span></li>
         <li><span class="metric-name">ADR 数量</span><span class="metric-val">9 篇</span></li>
         <li><span class="metric-name">跨机真网验证</span><span class="metric-val warn">待实测</span></li>
-        <li><span class="metric-name">内核优化</span><span class="metric-val">仅评估</span></li>
+        <li><span class="metric-name">AES-256-GCM 套件</span><span class="metric-val pass">已落地+实测</span></li>
       </ul>
     </div>
 
     <div class="dim-card">
       <div class="dim-header">
         <span class="dim-title">工程化水平</span>
-        <span class="dim-score">16<span class="out-of"> / 20</span></span>
+        <span class="dim-score">19<span class="out-of"> / 20</span></span>
       </div>
       <div class="progress-bar">
-        <div class="progress-fill good" style="width: 80%"></div>
+        <div class="progress-fill excellent" style="width: 95%"></div>
       </div>
       <ul class="metric-list">
-        <li><span class="metric-name">文档完整性</span><span class="metric-val">良好</span></li>
-        <li><span class="metric-name">CI/CD</span><span class="metric-val warn">未配置</span></li>
-        <li><span class="metric-name">配置外部化</span><span class="metric-val pass">完成</span></li>
+        <li><span class="metric-name">版本控制</span><span class="metric-val pass">git 本地仓库已建</span></li>
+        <li><span class="metric-name">CI/CD</span><span class="metric-val warn">待推送远端激活</span></li>
+        <li><span class="metric-name">贡献指南</span><span class="metric-val pass">CONTRIBUTING.md</span></li>
         <li><span class="metric-name">目录结构</span><span class="metric-val pass">规范</span></li>
       </ul>
     </div>
@@ -271,57 +271,53 @@
       <thead>
         <tr>
           <th>指标</th>
-          <th>测量值</th>
-          <th>换算</th>
+          <th>ChaCha20-Poly1305</th>
+          <th>AES-256-GCM（AES-NI）</th>
           <th>评级</th>
         </tr>
       </thead>
       <tbody>
         <tr>
           <td>AEAD 纯 seal 吞吐</td>
-          <td>0.52 GiB/s</td>
-          <td>~0.40 Mpps 单程</td>
-          <td class="val-good">良好</td>
+          <td>0.55 GiB/s</td>
+          <td class="val-good">1.03 GiB/s</td>
+          <td class="val-good">AES 1.9×</td>
         </tr>
         <tr>
           <td>AEAD seal+open 往返</td>
-          <td>0.26 GiB/s</td>
-          <td>~0.20 Mpps</td>
-          <td class="val-good">良好</td>
+          <td>0.28 GiB/s</td>
+          <td class="val-good">0.51 GiB/s</td>
+          <td class="val-good">AES 1.8×</td>
         </tr>
         <tr>
           <td>引擎完整单程 seal→handle</td>
-          <td><strong>0.37 GiB/s</strong></td>
-          <td><strong>0.28 Mpps ≈ 3.2 Gbps</strong></td>
+          <td>0.40 GiB/s（3.6 Gbps）</td>
+          <td class="val-good"><strong>0.85 GiB/s（7.5 Gbps）</strong></td>
           <td class="val-good">优秀</td>
         </tr>
         <tr>
           <td>分片（fragment only）</td>
-          <td>9.38 GiB/s</td>
-          <td>非瓶颈</td>
-          <td class="val-good">优秀</td>
+          <td colspan="2">9.60 GiB/s</td>
+          <td class="val-good">非瓶颈</td>
         </tr>
         <tr>
           <td>分片 + 重组</td>
-          <td>1.94 GiB/s</td>
-          <td>非瓶颈</td>
-          <td class="val-good">优秀</td>
+          <td colspan="2">2.38 GiB/s</td>
+          <td class="val-good">非瓶颈</td>
         </tr>
         <tr>
           <td>RouteTrace build（含签名）</td>
-          <td>13.4 µs/包</td>
-          <td>仅多跳控制面</td>
-          <td class="val-ok">可接受</td>
+          <td colspan="2">12.2 µs/包</td>
+          <td class="val-ok">仅多跳控制面</td>
         </tr>
         <tr>
           <td>RouteTrace verify（验签）</td>
-          <td>30.5 µs/包</td>
-          <td>≈ 0.33 Mpps 封顶</td>
-          <td class="val-ok">可接受</td>
+          <td colspan="2">23.7 µs/包</td>
+          <td class="val-ok">≈ 0.42 Mpps 封顶</td>
         </tr>
       </tbody>
     </table>
-    <p class="val-note" style="margin-top: 12px;">注：以上为 i9-13900H 单线程 release 构建实测数据。ChaCha20-Poly1305 为当前瓶颈，若换 AES-256-GCM（AES-NI）预计 3-4× 提升。</p>
+    <p class="val-note" style="margin-top: 12px;">注：i9-13900H 单线程 release 构建 2026-09-09 实测（bench_dataplane 双套件版）。AES-NI 使引擎上限从 3.6 Gbps 提至 7.5 Gbps（+108%）；剩余瓶颈转为 RouteTrace 验签与单线程上限（流级多核为下一杠杆）。默认套件仍为 ChaCha（Phase 1-4 线上兼容），AES 通过 Engine::set_cipher_suite 部署启用。</p>
   </div>
 
   <!-- 通包验证记录 -->
@@ -406,26 +402,26 @@
         <tr>
           <td>协议引擎性能</td>
           <td>30%</td>
-          <td>26 / 30</td>
-          <td>ChaCha20 无硬件加速，单线程 3.2 Gbps 距 10Gbps+ 有差距（-4）</td>
+          <td>27 / 30</td>
+          <td>AES-NI 实测 7.5 Gbps（-2 距 10Gbps+ 仍受单线程上限；-1 RouteTrace 验签 23.7µs 封顶多跳路径）</td>
         </tr>
         <tr>
           <td>代码质量</td>
           <td>25%</td>
           <td>24 / 25</td>
-          <td>C# 侧测试量偏少（仅 13 项，Rust 侧 208 项很强）（-1）</td>
+          <td>C# 侧测试量偏少（25 项 vs Rust 213 项；gRPC 真集成测试受 NuGet 限制未做）（-1）</td>
         </tr>
         <tr>
           <td>功能完整度</td>
           <td>25%</td>
           <td>22 / 25</td>
-          <td>跨机真网验证待回填（-2）；内核优化仅评估（-1）</td>
+          <td>跨机真网验证待回填（-2）；内核优化按 ADR-024 止步用户态（-1）</td>
         </tr>
         <tr>
           <td>工程化水平</td>
           <td>20%</td>
-          <td>16 / 20</td>
-          <td>缺少 CI/CD 流水线（-2）；缺少贡献指南（-2）</td>
+          <td>19 / 20</td>
+          <td>git 本地仓库已建立（初始提交 9b602ab，140 文件）；ci.yml/CONTRIBUTING 就绪，但尚未推送远端，Actions 未实际运行（-1）</td>
         </tr>
       </tbody>
     </table>
@@ -435,16 +431,16 @@
   <div class="section">
     <h2>五、下一步优化建议</h2>
     <ol class="suggestions">
-      <li><strong>启用 AES-256-GCM 套件（AES-NI 硬件加速）</strong><br>当前 ChaCha20 是主要瓶颈。AES-NI 可将 AEAD 吞吐提升 3-4 倍，直接拉高引擎上限至 ~10 Gbps 级别。风险低、收益大，建议作为性能优化第一优先级。</li>
-      <li><strong>配置 CI/CD 流水线</strong><br>目前零警告门禁仅在本地运行，建议接入 GitHub Actions 或 Gitee CI，每次提交自动跑 cargo test + clippy + dotnet build/test，保证质量门禁不退化。</li>
-      <li><strong>补跨机真网实测数据</strong><br>同机回环已全绿，但跨机（尤其是异网/跨 NAT）的真实网络环境下的性能数据尚未回填。找两台机器跑一次 verify-cross.ps1，把 RTT、丢包率、吞吐数据补进报告。</li>
-      <li><strong>wintun 批量 API 优化</strong><br>当前 wintun crate 用的是逐包读写，上游 wintun 支持 SessionStart/EndBatch 批量接口，可减少环形拷贝次数和唤醒开销。纯用户态、低风险，预估收益 10-20%。</li>
-      <li><strong>补充 C# 侧集成测试</strong><br>C# 侧目前只有 13 项单元/契约测试，建议增加 gRPC 桥接集成测试、NrptCleanupService 端到端测试、Host 启动流程测试，覆盖更多边界场景。</li>
+      <li><strong>✅ 已完成：启用 AES-256-GCM 套件并实测</strong><br>ADR-025 双套件已落地，本轮 bench 实测确认 AES-NI 使引擎单程吞吐 3.6 → 7.5 Gbps。生产部署通过 Engine::set_cipher_suite 在握手前启用；默认仍保持 ChaCha 以兼容 Phase 1-4 线上格式。</li>
+      <li><strong>推送远端仓库，激活 CI</strong><br>本地 git 仓库已建立（初始提交 9b602ab）。推送到 GitHub/Gitee 后 .github/workflows/ci.yml 即接管 clippy -D warnings + cargo test + dotnet build/test 门禁，杜绝质量回退。</li>
+      <li><strong>补跨机真网实测数据</strong><br>同机回环已全绿；09-09 现场诊断确认本机 WLAN 当前无公网入口（v4 NAT + 无 v6 GUA），跨机直连需换网络环境或走 WS 中转链路回填。找两台可达机器跑 verify-cross.ps1，补 RTT、丢包率、吞吐。</li>
+      <li><strong>流级多核扩展</strong><br>AES 之后单线程引擎不再是首要瓶颈，RouteTrace 验签（23.7 µs/包）与单核上限成为新天花板。按流（五元组）分片到多 worker 是下一个最大杠杆。</li>
+      <li><strong>补充 C# 侧集成测试</strong><br>C# 侧已扩至 25 项；gRPC 桥接集成测试受 NuGet 未解禁限制仍未做，环境解锁后优先补齐。</li>
     </ol>
   </div>
 
   <div class="footer">
-    IPv8+ 性能评分报告 · 生成于 2026-09-09 · 基于 Phase 5 完成状态评估
+    IPv8+ 性能评分报告 · v2 · 更新于 2026-09-09 · 基于 Phase 5 完成 + AES-256-GCM 实测 + git 初始化后状态评估
   </div>
 </div>
 </body>

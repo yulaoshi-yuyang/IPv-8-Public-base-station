@@ -45,6 +45,10 @@
   地址，天然打洞语义——内网机当发起方、v6 机应答并现学回包目的地）。
   对端文件包：`deploy/cross-verify/`（exe + wintun.dll + 脚本 + 使用说明），
   两台 Windows x64 各放一份即可开测。待真机实测回填结果。
+  **包内 exe 一律由 `scripts/make-peer-pack.ps1` 再生成**（内部 `cargo build --release`
+  后刷新 pack + `deploy/ipv8-cross-verify.zip`，勿手工复制）；若 `target\release` 被
+  运行中的节点锁定，先 `cargo build … --target-dir target\pack` 再
+  `powershell -File scripts\make-peer-pack.ps1 -SourceDir target\pack\release`。
 - [x] **Phase 2 · 证书认证握手**（`ipv8-tunnel::auth`，7 测试全绿）
   - CA（Ed25519）签发 `addr ‖ ed_pub ‖ not_after` 证书；握手 Init/Resp 各附
     证书 + 对 transcript 的签名，接收方三验（CA 签名 → 有效期 → transcript 绑定）。

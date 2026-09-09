@@ -133,6 +133,12 @@ $pz = $null   # local zoneserver process (Zone mode)
 $code = 1
 try {
     if (-not (Test-Path $exe)) { throw "missing $exe - run: cargo build --release -p ipv8-wintun-node" }
+    # Staleness guard: newest source file vs built exe.
+    $newestSrc = Get-ChildItem -LiteralPath (Join-Path $root 'src') -Recurse -Include *.rs,Cargo.toml -File -ErrorAction SilentlyContinue |
+                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($newestSrc -and $newestSrc.LastWriteTime -gt (Get-Item $exe).LastWriteTime) {
+        Write-Host "[verify] WARNING: source newer than $exe (touched $($newestSrc.Name)) - run: cargo build --release -p ipv8-wintun-node -p ipv8-zoneserver"
+    }
     if (-not (Test-Path (Join-Path (Split-Path $exe) 'wintun.dll'))) { Copy-Item $dll (Split-Path $exe) -Force }
     Remove-Item $la, $lb, $lae, $lbe -ErrorAction SilentlyContinue
 
