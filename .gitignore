@@ -59,3 +59,7 @@ scripts/ipv8-node.exe
 
 # One-off sharing artifacts
 .trae-html-share-packages/
+
+# Private deployment info (kept local only; see pre-push decision 2026-09-09)
+tools/cloudflared/cloudflared-ipv8-test.yml
+docs/references/
