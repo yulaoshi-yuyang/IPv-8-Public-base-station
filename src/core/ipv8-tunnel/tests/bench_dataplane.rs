@@ -12,11 +12,14 @@
 
 use std::time::Instant;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use ed25519_dalek::{Signer, Verifier};
 use ipv8_codec::{encode, fragment_packet, IPv8Address, IPv8Header, Reassembler, RouteTrace};
 use ipv8_routing::build_route_trace;
 use ipv8_tunnel::crypto::{CipherSuite, Identity, TunnelKeys};
-use ipv8_tunnel::{Engine, State};
+use ipv8_tunnel::{Engine, FlowShards, ShardSink, State};
 
 fn gib_per_s(bytes: u64, secs: f64) -> f64 {
     bytes as f64 / secs / (1 << 30) as f64
@@ -184,4 +187,111 @@ fn engine_loopback_data_plane() {
             ROUNDS as f64 / s * 1432.0 * 8.0 / 1e9
         );
     }
+}
+
+/// 流级分片多核吞吐（ADR-026）：seal 侧 N worker 并行封装 + 单线程搬运喂入对端。
+/// 口径含 channel 搬运（比纯 seal 保守），但并行度收益清晰可见。
+#[test]
+#[ignore]
+fn flow_shards_scaling() {
+    const N_SHARDS: &[usize] = &[1, 2, 4, 8];
+    const FLOWS: usize = 64;
+    const ROUNDS: u64 = 40_000;
+
+    for suite in [CipherSuite::ChaCha20Poly1305, CipherSuite::Aes256Gcm] {
+        for &n in N_SHARDS {
+            let (mut alice, mut bob) = plain_pair(suite);
+            let resp = bob.handle_frame(&alice.start_handshake()).unwrap();
+            alice.handle_frame(&resp);
+            let (a_shards, al, ap, mtu) = alice.split_shards(n).unwrap();
+            let (b_shards, bl, bp, _) = bob.split_shards(n).unwrap();
+
+            let (a_frames, a_out) = frame_collector();
+            let (b_frames, b_out) = frame_collector();
+            let b_ok = Arc::new(AtomicU64::new(0));
+            let b_sink = {
+                let c = b_ok.clone();
+                Arc::new(move |_: Vec<u8>| {
+                    c.fetch_add(1, Ordering::Relaxed);
+                })
+            };
+            let noop: ShardSink = Arc::new(|_| {});
+            let ash = FlowShards::new(a_shards, al, ap, mtu, a_frames, noop.clone());
+            let bsh = FlowShards::new(b_shards, bl, bp, mtu, b_frames, b_sink);
+
+            // 多流载荷（src 末字节区分 64 条流）
+            let flows: Vec<Vec<u8>> = (0..FLOWS as u8)
+                .map(|i| {
+                    let mut p = vec![0x45u8; PAYLOAD];
+                    p[15] = i; // IPv4 src 末字节（offset 12..16）
+                    p
+                })
+                .collect();
+
+            let t = Instant::now();
+            let deadline = t + std::time::Duration::from_secs(60);
+            let mut next = 0u64;
+            loop {
+                // 注入侧：持续喂到全部发出（channel 背压自然限流）
+                while next < ROUNDS {
+                    if ash.seal_dispatch(&flows[(next as usize) % FLOWS]).is_err() {
+                        break; // worker 停摆：交给下一轮搬运/判定处理
+                    }
+                    next += 1;
+                }
+                // 搬运 A→B
+                let fa: Vec<Vec<u8>> = a_out.lock().unwrap().drain(..).collect();
+                for f in &fa {
+                    bsh.handle_inbound(f);
+                }
+                // 搬运 B→A（回显帧；A 侧 sink 计数丢弃）
+                let fb: Vec<Vec<u8>> = b_out.lock().unwrap().drain(..).collect();
+                for f in &fb {
+                    ash.handle_inbound(f);
+                }
+                let done = b_ok.load(Ordering::Relaxed);
+                if done >= ROUNDS {
+                    break;
+                }
+                if next >= ROUNDS && fa.is_empty() && fb.is_empty()
+                    && Instant::now() > deadline
+                {
+                    panic!(
+                        "n={n} {:?} 停滞：delivered={done}/{ROUNDS}",
+                        suite,
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            let s = t.elapsed().as_secs_f64();
+            println!(
+                "[bench] 流级分片({suite:?}, n={n}) 往返吞吐 {:.2} GiB/s ≈ {:.1} Gbps | {:.2} Mpps",
+                gib_per_s(ROUNDS * PAYLOAD as u64, s),
+                ROUNDS as f64 / s * 1432.0 * 8.0 / 1e9,
+                ROUNDS as f64 / s / 1e6
+            );
+        }
+    }
+}
+
+fn plain_pair(suite: CipherSuite) -> (Engine, Engine) {
+    let mut alice = Engine::new(
+        Identity::from_bytes([1u8; 32]),
+        IPv8Address::new(1, 1, 0, 0, 0),
+        IPv8Address::new(1, 2, 0, 0, 0),
+    );
+    let mut bob = Engine::new(
+        Identity::from_bytes([2u8; 32]),
+        IPv8Address::new(1, 2, 0, 0, 0),
+        IPv8Address::new(1, 1, 0, 0, 0),
+    );
+    alice.set_cipher_suite(suite);
+    bob.set_cipher_suite(suite);
+    (alice, bob)
+}
+
+fn frame_collector() -> (ShardSink, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+    let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let o = out.clone();
+    (Arc::new(move |v: Vec<u8>| o.lock().unwrap().push(v)), out)
 }

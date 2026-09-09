@@ -111,6 +111,8 @@ pub enum FrameError {
     BadHandshakeLen,
     /// 帧内密码套件与本端配置不符（部署漂移诊断；ADR-025）
     SuiteMismatch { expected: CipherSuite, got: CipherSuite },
+    /// 帧的 epoch 不属于本分片 SA（epoch ≢ shard mod stride；ADR-026 流级分片）
+    ShardMismatch { epoch: u64, shard: u64, stride: u64 },
     /// 认证握手失败（伪造证书/过期/transcript 签名无效）
     AuthFailed,
     /// 解码 IPv8+ 头失败
@@ -135,6 +137,9 @@ impl core::fmt::Display for FrameError {
             Self::BadHandshakeLen => write!(f, "握手帧长度不合法"),
             Self::SuiteMismatch { expected, got } => {
                 write!(f, "对端帧套件 {got:?} 与本端配置 {expected:?} 不符")
+            }
+            Self::ShardMismatch { epoch, shard, stride } => {
+                write!(f, "帧 epoch {epoch} 不属于分片 {shard}（步幅 {stride}）")
             }
             Self::AuthFailed => write!(f, "认证握手失败"),
             Self::Header(e) => write!(f, "IPv8+ 头解析失败: {e}"),

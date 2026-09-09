@@ -11,12 +11,14 @@
 //! - [`encapsulate`]：IPv8+ ⇄ 隧道帧（AAD 绑定明文头，扩展头保持明文）
 //! - [`fallback`]：v9 §11 分级降级状态机（四级路径 + 分级超时 + 降级缓存）
 //! - [`tun_worker`]：独立读线程 + mpsc（v9 §8；设备经 TunIo 注入，CI 用 Mock）
+//! - [`flow`]：流级分片数据面（ADR-026 多核：N worker 并行 seal/open，epoch 同余类路由）
 
 pub mod auth;
 pub mod crypto;
 pub mod engine;
 pub mod encapsulate;
 pub mod fallback;
+pub mod flow;
 pub mod frame;
 pub mod handshake;
 pub mod tun_worker;
@@ -34,4 +36,5 @@ pub use auth::{
 };
 pub use engine::{Engine, EngineError, EngineStats, State};
 pub use fallback::{FallbackManager, FallbackOptions, Failure, Level, Path, Resolved};
+pub use flow::{hash_flow, FlowShards, ShardStats, Sink as ShardSink};
 pub use tun_worker::{mock_tun, ClosableMockTun, MockTun, MockTunHandle, TunError, TunIo, TunWorker};

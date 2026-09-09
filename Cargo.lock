@@ -824,6 +824,7 @@ version = "0.9.0"
 dependencies = [
  "ipv8-codec",
  "ipv8-grpc",
+ "ipv8-resolver",
  "ipv8-tunnel",
  "ipv8-zoneserver",
  "tokio",

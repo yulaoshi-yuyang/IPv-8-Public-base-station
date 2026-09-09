@@ -26,8 +26,8 @@ use ipv8_tunnel::auth::{
     HostIdentity, TrustAnchor, NO_EXPIRY,
 };
 use ipv8_tunnel::{
-    Engine, FallbackManager, FallbackOptions, Failure, Identity, Level,
-    Path as FallbackPath, Resolved, State,
+    Engine, FallbackManager, FallbackOptions, Failure, FlowShards, Identity, Level,
+    Path as FallbackPath, Resolved, ShardSink, ShardStats, State,
 };
 
 /// 墙钟 epoch 秒（认证握手的证书过期校验用）
@@ -54,6 +54,86 @@ fn parse_seed(s: &str) -> Result<[u8; 32], String> {
 }
 
 const TUNNEL_TYPE: &str = "IPv8Plus Tunnel";
+
+/// ADR-026 级 2：打洞"敲门"包。仅作撞活 NAT 映射之用，不含语义；
+/// 收侧在进引擎解析前静默吸收（不污染 dropped 计数判据）。
+const PUNCH_KNOCK: &[u8] = b"IP8PUNCH";
+
+/// Data 面分片生命周期（--shards>1 时启用）。主循环负责在 Established /
+/// 重协商点换片；TUN 读线程经 `seal` 投递出站，UDP 收线程经 `feed` 喂入站。
+/// 锁序约束：允许 engine → hub，禁止在持 hub 时取 engine 锁。
+#[derive(Default)]
+struct ShardHub {
+    shards: Option<FlowShards>,
+    /// 已退役分片的累计计数（重协商换片后 [stats] 单调性不因换片倒退）
+    off: ShardStats,
+}
+
+impl ShardHub {
+    /// 出站批量投递：分片活跃返回 true（帧由各 worker 经装填时锁定的
+    /// 当前 transport 出口异步发出；重协商/降级换片时 dest 随之更新）
+    fn seal(&self, batch: &[Vec<u8>]) -> bool {
+        match &self.shards {
+            Some(sh) => {
+                for b in batch {
+                    if sh.seal_dispatch(b).is_err() {
+                        return false; // 分片已停摆：回落单点路径
+                    }
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 入站投递：Data 帧且分片活跃返回 true（本帧已被分片接管）
+    fn feed(&self, frame: &[u8]) -> bool {
+        match &self.shards {
+            Some(sh) => sh.handle_inbound(frame),
+            None => false,
+        }
+    }
+
+    /// 现役 + 退役累计的聚合视图（stats 打印与首包超时判据共用）
+    fn stats(&self) -> ShardStats {
+        let cur = self
+            .shards
+            .as_ref()
+            .map(|s| s.stats())
+            .unwrap_or(ShardStats { sealed: 0, delivered: 0, dropped: 0, fragments_sent: 0, fragments_reassembled: 0 });
+        ShardStats {
+            sealed: self.off.sealed + cur.sealed,
+            delivered: self.off.delivered + cur.delivered,
+            dropped: self.off.dropped + cur.dropped,
+            fragments_sent: self.off.fragments_sent + cur.fragments_sent,
+            fragments_reassembled: self.off.fragments_reassembled + cur.fragments_reassembled,
+        }
+    }
+
+    /// 装填新分片（调用方先 shutdown 旧分片；本方法只做替换）
+    fn install(&mut self, s: FlowShards) {
+        self.shards = Some(s);
+    }
+
+    /// 活跃分片数（stats 行展示；0 = 单点路径）
+    fn active(&self) -> usize {
+        self.shards.as_ref().map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// 拆下当前分片并把其计数并入退役累计（shutdown 由调用方在锁外执行）
+    fn retire(&mut self) -> Option<FlowShards> {
+        let old = self.shards.take();
+        if let Some(s) = &old {
+            let st = s.stats();
+            self.off.sealed += st.sealed;
+            self.off.delivered += st.delivered;
+            self.off.dropped += st.dropped;
+            self.off.fragments_sent += st.fragments_sent;
+            self.off.fragments_reassembled += st.fragments_reassembled;
+        }
+        old
+    }
+}
 
 #[derive(Debug)]
 struct Config {
@@ -105,6 +185,17 @@ struct Config {
     /// 主机侧地址前缀（默认 100.64.0.0/10 即 CGNAT；
     /// 同机联调可用 10.2xx.0.0/24 等与本机路由不冲突的段）
     tun_prefix: u8,
+    /// ADR-026 级 2：Resolver 地址（--resolver http://host:port）。
+    /// 提供时节点向 Resolver 登记并周期会合，取回对端候选地址打洞。
+    resolver: Option<String>,
+    /// 启用打洞编排（必须配 --resolver 与 --ed-seed）。
+    /// --peer-ip 变成占位（决定 socket 绑定族：候选是 v6 就填任意 v6）。
+    punch: bool,
+    /// ADR-026 性能线：Data 面流级分片 worker 数（--shards N，默认 1 = 单点
+    /// 零回归）。Established 后自动拆分，同流同 worker 保 nonce 唯一。
+    /// 仅真实 TUN 路径生效；--no-tun 回显验证件恒用单点引擎。
+    /// 两端必须一致（部署配置，同 ADR-025 套件哲学）。
+    shards: usize,
 }
 
 fn usage() -> ! {
@@ -124,6 +215,12 @@ fn usage() -> ! {
          \x20\x20 # --cert-cache <file>（配 --zone）：证书持久化，重启命中缓存免注册\n\
          [--fallback [--alt-ip <IPv4|IPv6> --alt-port <u16>]]\n\
          \x20\x20 # v9 §11 分级降级驱动：主入口超时→级联备用入口→明文 UDP；--alt 为备用入口\n\
+         [--resolver http://host:port --punch --ed-seed <64hex>]\n\
+         \x20\x20 # ADR-026 级 2 打洞：向 Resolver 登记+会合，取对端 observed 候选撞洞\n\
+         \x20\x20 # （--peer-ip 占位定绑定族；应答方自动现学回程地址）\n\
+         [--shards N]\n\
+         \x20\x20 # ADR-026 性能线：Data 面流级分片 worker 数（1..=64，默认 1=单点）。\n\
+         \x20\x20 # Established 后自动拆分并行加解密；两端必须取相同 N（错配=丢包非错交付）\n\
          拓扑: 恰好一端 --initiate（主动），另一端被动等待 Init\n\
          示例(A 机主动): ipv8-node --self 0000fb14000000010001000001000000 \\\n\
          \x20\x20 --peer-addr 0000fb14000000020001000001000000 --peer-ip 192.168.1.12 --tun-ip 100.64.0.1 --initiate\n\
@@ -222,6 +319,26 @@ fn parse_args() -> Result<Config, String> {
     };
     let zone = get("--zone");
     let cert_cache = get("--cert-cache").map(PathBuf::from);
+    let resolver = get("--resolver");
+    let punch = argv.iter().any(|a| a == "--punch");
+    let shards = match get("--shards") {
+        Some(s) => {
+            let v: usize = s.parse().map_err(|_| "--shards 非数字".to_string())?;
+            if v == 0 || v > 64 {
+                return Err(format!("--shards 必须在 1..=64，收到 {v}"));
+            }
+            v
+        }
+        None => 1,
+    };
+    if punch {
+        if resolver.is_none() {
+            return Err("--punch 需要 --resolver <url>（会合信令走 Resolver）".to_string());
+        }
+        if ed_seed.is_none() {
+            return Err("--punch 需要 --ed-seed（登记/会合 PoP 用节点私钥）".to_string());
+        }
+    }
     if cert_cache.is_some() && zone.is_none() {
         return Err("--cert-cache 仅在 --zone 注册路径下有意义".to_string());
     }
@@ -263,6 +380,9 @@ fn parse_args() -> Result<Config, String> {
         cert_cache,
         adapter_name,
         tun_prefix,
+        resolver,
+        punch,
+        shards,
     })
 }
 
@@ -504,6 +624,11 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
     // -Fragment 验证时调大，使整包进 TUN 后由 IPv8+ 层分片）
     engine.lock().expect("engine").set_mtu(cfg.mtu);
 
+    // ---- ADR-026 流级分片中枢：Established 后由主循环装填（--shards 1..=64，
+    // 默认 1 = 永不启用零回归；--no-tun 回显验证件恒单点）----
+    let hub: Arc<Mutex<ShardHub>> = Arc::new(Mutex::new(ShardHub::default()));
+    let has_tun = session.is_some();
+
     // ---- UDP 外层（一个 socket 同时收发；send_to/recv_from 均 &self 可跨线程）----
     // 绑定族跟随 --peer-ip：v6 对端绑 :: （std 对未指定 v6 地址默认双栈，
     // 现学到 v4 映射源地址后仍可从同一 socket 回发）。
@@ -579,6 +704,119 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
         );
     }
 
+    // ---- ADR-026 级 2：打洞编排（--punch + --resolver）----
+    // 每轮：登记（首轮，取服务端所见 observed 回显）→ 会合拿对端候选
+    // （Resolver 把"它看到的对端源地址"排首位）→ 向候选连发敲门包撞活
+    // 双方 NAT 映射；发起方在隧道未建立时把 Init 目标改指首选候选，
+    // 之后握手由既有主循环幂等重发驱动，应答方 --learn-peer 现学回位。
+    // 20s 周期 = 心跳刷新 observed（服务端窗口 90s，1:4.5 安全比）。
+    if cfg.punch {
+        let url = cfg.resolver.clone().expect("parse 已校验");
+        let ed = cfg.ed_seed.expect("parse 已校验");
+        let (sock2, engine2, sched2) = (sock.clone(), engine.clone(), sched.clone());
+        let (sa, pa, port) = (cfg.self_addr, cfg.peer_addr, cfg.udp_port);
+        let initiate2 = cfg.initiate;
+        let ed_pub = verify_key_from_seed(ed);
+        let addr_text = sa.to_canonical_string();
+        let peer_text = pa.to_canonical_string();
+        println!("[ipv8-node] 模式: PUNCH（ADR-026 级 2 打洞，Resolver={url}）");
+        tokio::spawn(async move {
+            use ipv8_resolver::grpc::pb::resolver_client::ResolverClient;
+            use ipv8_resolver::grpc::pb::{RegisterRequest, RendezvousRequest};
+            use ipv8_resolver::{register_pop_message, rendezvous_pop_message};
+            let mut registered = false;
+            loop {
+                match ResolverClient::connect(url.clone()).await {
+                    Err(e) => println!("[punch] 连接 Resolver {url} 失败: {e}（30s 后重试）"),
+                    Ok(mut c) => {
+                        if !registered {
+                            let proof = pop_sign(ed, &register_pop_message(&addr_text, &ed_pub));
+                            let req = RegisterRequest {
+                                name: String::new(),
+                                addr_text: addr_text.clone(),
+                                ed_pub: ed_pub.to_vec(),
+                                proof: proof.to_vec(),
+                                // 打洞模式下没有可预登记的入口——真实映射由服务端 observed 观察
+                                tunnel_entry: format!("0.0.0.0:{port}"),
+                                alt_entries: vec![],
+                                mtu: 0,
+                                ttl: 120,
+                                ipv8_capable: true,
+                            };
+                            match c.register(req).await {
+                                Ok(r) => {
+                                    let o = r.into_inner();
+                                    println!(
+                                        "[punch] 已登记 Resolver，本端公网映射 observed={}",
+                                        if o.observed_addr.is_empty() { "(不可观察)" } else { &o.observed_addr }
+                                    );
+                                    registered = true;
+                                }
+                                Err(e) => println!("[punch] 登记失败: {e:?}"),
+                            }
+                        }
+                        let proof = pop_sign(ed, &rendezvous_pop_message(&addr_text, &peer_text));
+                        let req = RendezvousRequest {
+                            addr_text: addr_text.clone(),
+                            proof: proof.to_vec(),
+                            peer_addr_text: peer_text.clone(),
+                            local_candidates: vec![],
+                        };
+                        match c.rendezvous(req).await {
+                            Ok(r) => {
+                                let out = r.into_inner();
+                                if !out.peer_candidates.is_empty() {
+                                    println!("[punch] 对端候选（observed 优先）: {:?}", out.peer_candidates);
+                                    // 只用首选候选（服务端权威观察）；失败下轮自动换
+                                    if let Some(dest) = out
+                                        .peer_candidates
+                                        .iter()
+                                        .filter_map(|c| c.parse::<SocketAddr>().ok())
+                                        // 双栈适配：socket 绑在 v6（占位 --peer-ip 为 v6）
+                                        // 而候选是 v4 时，Windows 需显式 v4-mapped 才可发
+                                        // （Ipv6Addr::from(Ipv4Addr) = ::a.b.c.d 即映射形）
+                                        .map(|a| match (sock2.local_addr().ok(), a) {
+                                            (Some(l), SocketAddr::V4(v4)) if l.is_ipv6() => {
+                                                let o = v4.ip().octets();
+                                                let mapped = Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff,
+                                                    u16::from_be_bytes([o[0], o[1]]),
+                                                    u16::from_be_bytes([o[2], o[3]]));
+                                                SocketAddr::new(IpAddr::V6(mapped), a.port())
+                                            }
+                                            _ => a,
+                                        })
+                                        .next()
+                                    {
+                                        for _ in 0..3 {
+                                            let _ = sock2.send_to(PUNCH_KNOCK, dest);
+                                        }
+                                        if initiate2 {
+                                            let est = {
+                                                let g = engine2.lock().expect("engine");
+                                                g.stats().state == State::Established
+                                            };
+                                            if !est {
+                                                let mut sc = sched2.lock().expect("sched");
+                                                sc.transport = Transport::Tunnel(dest);
+                                                if let Some((f, t0, _)) = sc.attempt.clone() {
+                                                    sc.attempt = Some((f, t0, dest));
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    println!("[punch] 会合成功但对端无候选（等对端上线）");
+                                }
+                            }
+                            Err(e) => println!("[punch] 会合失败: {}（对端未登记/签名域错？）", e.code()),
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(20)).await;
+            }
+        });
+    }
+
     // 角色：仅主动方发起握手；被动方等对端 Init（双方同时主动会互相
     // 拒绝对端的 Init 而永久死锁）。
     // - fallback 关：Phase 1 行为，Init 每 tick 幂等重发，不限时。
@@ -620,6 +858,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
         let engine = engine.clone();
         let sock = sock.clone();
         let sched = sched.clone();
+        let hub = hub.clone();
         // 用户态批处理（"wintun 批量优化"的正确落地形态）：
         // wintun 官方 C API（0.14.x）只有单包 ReceivePacket/SendPacket，
         // 不存在 StartBatch/EndBatch；真正可省的是**每包一次** engine/sched
@@ -661,6 +900,15 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
             match transport {
                 // 超 MTU 的内层包 → IPv8+ 分片为多帧，逐帧交 UDP（v9 §8/§7.8）
                 Transport::Tunnel(dest) => {
+                    // ADR-026：分片活跃 → 批投给 workers（同流同片，锁外并行
+                    // 封装，帧经出口线程异步发出）；未活跃 → 原单点批量路径。
+                    let used_shards = {
+                        let hb = hub.lock().expect("hub");
+                        hb.seal(&batch)
+                    };
+                    if used_shards {
+                        continue;
+                    }
                     let mut out: Vec<Vec<u8>> = Vec::new();
                     {
                         let mut g = engine.lock().expect("engine");
@@ -738,8 +986,11 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
         let sock = sock.clone();
         let session = session.clone();
         let sched = sched.clone();
+        let hub = hub.clone();
         let plain_demux = cfg.fallback;
-        let learn = cfg.learn_peer;
+        let learn = cfg.learn_peer || (cfg.punch && !cfg.initiate); // punch 应答方自动现学：
+    // 发起方的 Init 会从"服务端所见本端映射"到达——与配置的占位 --peer-ip
+    // 不同源，不现学则握手响应回错地址（learn-peer 的既有语义正为此设计）。
         let is_initiator = cfg.initiate;
         let echo_ok = echo_ok.clone();
         let echo_bad = echo_bad.clone();
@@ -750,6 +1001,11 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
                 match sock.recv_from(&mut buf) {
                     Ok((n, from)) => {
                         let raw = &buf[..n];
+                        // 打洞敲门包：只用于撞活 NAT 映射，静默吸收——
+                        // 不进引擎（否则污染 dropped 判据）、不回包。
+                        if raw == PUNCH_KNOCK {
+                            continue;
+                        }
                         // 明文降级入包：非隧道帧（Ver 字节≠0x01）→ 直接注入 TUN。
                         // 仅在 -Fallback 验证下启用，避免改变既有模式丢弃语义。
                         if plain_demux && (n < 10 || raw[0] != 0x01) {
@@ -793,6 +1049,11 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
                             learned = true;
                         }
                         let (resp, delivered) = {
+                            // ADR-026：分片活跃时 Data 帧由 workers 接管
+                            // （同余路由免解密定片）；握手/控制帧仍走引擎状态机。
+                            if hub.lock().expect("hub").feed(raw) {
+                                continue;
+                            }
                             let mut g = engine.lock().expect("engine");
                             let r = g.handle_frame_at(raw, now_epoch_secs());
                             (r, g.take_delivered())
@@ -874,11 +1135,85 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
         tokio::select! {
             _ = ticker.tick() => {
                 let now = now_epoch_secs();
-                let st = engine.lock().expect("engine").stats();
+                let (st, eng_sharded) = {
+                    let g = engine.lock().expect("engine");
+                    (g.stats(), g.is_sharded())
+                };
+
+                // ---- ADR-026 分片生命周期（必须取 sched 锁之前处理：退役
+                // join worker 时，分片出口线程可能正持 sched 发包）----
+                if cfg.shards > 1 && has_tun {
+                    let hb_active = hub.lock().expect("hub").active() > 0;
+                    if hb_active && !eng_sharded {
+                        // 隧道已重协商（引擎换密钥并解冻）→ 旧分片作废退役
+                        let old = hub.lock().expect("hub").retire();
+                        if let Some(s) = old {
+                            println!("[shards] 隧道重协商 → 旧 {} 分片退役（下 tick 按新密钥重组）", s.len());
+                            s.shutdown();
+                        }
+                    } else if st.state == State::Established && !hb_active && !eng_sharded {
+                        if let Ok((shards, la, pa, mtu)) =
+                            engine.lock().expect("engine").split_shards(cfg.shards)
+                        {
+                            let (sock2, sched2) = (sock.clone(), sched.clone());
+                            let frames: ShardSink = Arc::new(move |f: Vec<u8>| {
+                                let dest = match sched2.lock().expect("sched").transport {
+                                    Transport::Tunnel(d) | Transport::PlainUdp(d) => d,
+                                };
+                                if let Err(e) = sock2.send_to(&f, dest) {
+                                    eprintln!("[shard→udp] send 失败: {e}");
+                                }
+                            });
+                            let session2 = session.clone();
+                            let delivered: ShardSink = Arc::new(move |pkt: Vec<u8>| {
+                                let Some(sess) = &session2 else { return };
+                                match sess.allocate_send_packet(pkt.len() as u16) {
+                                    Ok(mut p) => {
+                                        p.bytes_mut().copy_from_slice(&pkt);
+                                        sess.send_packet(p);
+                                    }
+                                    Err(e) => eprintln!("[shard→tun] allocate_send_packet: {e}"),
+                                }
+                            });
+                            let sh = FlowShards::new(shards, la, pa, mtu, frames, delivered);
+                            println!(
+                                "[shards] ADR-026 流级分片启用: {} workers（同流同片；两端 --shards 必须一致）",
+                                sh.len()
+                            );
+                            hub.lock().expect("hub").install(sh);
+                        }
+                    }
+                }
+
                 let mut sc = sched.lock().expect("sched");
                 let fb_on = cfg.fallback;
 
                 if st.state == State::Established {
+                    // 统计口径：分片活跃时用聚合计数（单点引擎数据面已冻结）
+                    let (sealed, deliv, dropped, f_sent, f_re, nsh) = {
+                        let hb = hub.lock().expect("hub");
+                        match hb.active() {
+                            0 => (
+                                st.sealed_outbound,
+                                st.delivered_inbound,
+                                st.dropped_inbound,
+                                st.fragments_sent,
+                                st.fragments_reassembled,
+                                0usize,
+                            ),
+                            _ => {
+                                let s = hb.stats();
+                                (
+                                    s.sealed,
+                                    s.delivered,
+                                    s.dropped,
+                                    s.fragments_sent,
+                                    s.fragments_reassembled,
+                                    hb.active(),
+                                )
+                            }
+                        }
+                    };
                     // 隧道成功：记一次（清降级缓存、备用入口提正、记 last_good）
                     if fb_on && !sc.success_recorded {
                         let cur = sc.current.clone();
@@ -890,7 +1225,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
                         }
                         sc.success_recorded = true;
                         sc.est_started = Some(now);
-                        sc.est_delivered = st.delivered_inbound;
+                        sc.est_delivered = deliv;
                     }
                     if !established_reported {
                         println!(
@@ -900,22 +1235,23 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
                         established_reported = true;
                     } else {
                         println!(
-                            "[stats] epoch={} sealed={} delivered={} dropped={} frags_sent={} frags_reassembled={} plain_tx={} plain_rx={} echo_ok={} echo_bad={}",
+                            "[stats] epoch={} sealed={} delivered={} dropped={} frags_sent={} frags_reassembled={} plain_tx={} plain_rx={} echo_ok={} echo_bad={} shards={}",
                             st.send_epoch.unwrap_or(0),
-                            st.sealed_outbound,
-                            st.delivered_inbound,
-                            st.dropped_inbound,
-                            st.fragments_sent,
-                            st.fragments_reassembled,
+                            sealed,
+                            deliv,
+                            dropped,
+                            f_sent,
+                            f_re,
                             sc.plain_tx,
                             sc.plain_rx,
                             echo_ok.load(Ordering::Relaxed),
-                            echo_bad.load(Ordering::Relaxed)
+                            echo_bad.load(Ordering::Relaxed),
+                            nsh
                         );
                     }
                     // 首包超时（v9 §11：隧道已建但数据不通 → 不浪费重试，直接降级）：
                     // 已发包但 3s 内 delivered 无增长 → 拆死隧道重排路径
-                    if fb_on && st.sealed_outbound > 0 && st.delivered_inbound == sc.est_delivered {
+                    if fb_on && sealed > 0 && deliv == sc.est_delivered {
                         if let Some(t0) = sc.est_started {
                             if now.saturating_sub(t0) >= sc.fb.first_packet_timeout().as_secs() {
                                 println!("[fallback] 首包超时（隧道半开）→ reset + record_failure，走表降级");

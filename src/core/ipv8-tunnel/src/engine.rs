@@ -113,6 +113,9 @@ pub struct Engine {
     forwarded: u64,
     /// 验证失败被拒的转发包数（含本不该找上我的
     fwd_rejected: u64,
+    /// 数据面已移交 FlowShards 分片（ADR-026）：单点 seal/Data 处理冻结，
+    /// keys 已派生至各分片 SA。握手状态机不受影响。
+    sharded: bool,
 }
 
 impl Engine {
@@ -144,6 +147,7 @@ impl Engine {
             forward_out: VecDeque::new(),
             forwarded: 0,
             fwd_rejected: 0,
+            sharded: false,
         }
     }
 
@@ -180,6 +184,7 @@ impl Engine {
             forward_out: VecDeque::new(),
             forwarded: 0,
             fwd_rejected: 0,
+            sharded: false,
         }
     }
 
@@ -214,6 +219,39 @@ impl Engine {
     /// 本引擎配置的套件
     pub fn cipher_suite(&self) -> CipherSuite {
         self.cipher_suite
+    }
+
+    /// 数据面是否已移交分片（冻结单点 seal/Data）
+    pub fn is_sharded(&self) -> bool {
+        self.sharded
+    }
+
+    /// 把已建立隧道的单点密钥状态拆成 N 个流级分片 SA（ADR-026 多核扩展）。
+    ///
+    /// 调用后本引擎进入「控制面模式」：`seal_frame`/`seal_frames`/`seal_prebuilt`
+    /// 与 Data 帧处理一律拒绝（`NotEstablished`），数据面由上层
+    /// [`crate::flow::FlowShards`] 的 worker 各持分片 SA 并行处理；握手、
+    /// 幂等重发、降级等控制面逻辑完全保留。
+    ///
+    /// 语义要点：
+    /// - 前置：Established、尚未拆分、`n ≥ 1`；
+    /// - 拆出后单点 `keys` 即清空——计数器/nonce 主权移交各分片，杜绝双写；
+    /// - 对端必须用**相同 N 与套件**拆分（同 ADR-025 部署配置哲学），
+    ///   错配表现为重放窗口互踩导致丢包（非误交付），可诊断；
+    /// - 隧道重协商（收到新 Init）会重建单点 keys，但**旧分片 SA 不会自动
+    ///   失效**——调用方必须先 shutdown 分片再触发握手（node 已按此顺序接）。
+    pub fn split_shards(
+        &mut self,
+        n: usize,
+    ) -> Result<(Vec<TunnelKeys>, IPv8Address, IPv8Address, usize), EngineError> {
+        if n == 0 || self.state != State::Established || self.keys.is_none() || self.sharded {
+            return Err(EngineError::NotEstablished);
+        }
+        let base = self.keys.take().expect("上方已检");
+        let shards =
+            (0..n as u64).map(|k| base.derive_shard(k, n as u64)).collect::<Vec<_>>();
+        self.sharded = true;
+        Ok((shards, self.local_addr, self.peer_addr, self.mtu))
     }
 
     /// 最近一次认证握手失败原因（MITM/错配/伪过期），无则 None
@@ -305,6 +343,7 @@ impl Engine {
                         let (resp_body, mut keys) = accept_init(identity, body).ok()?;
                         keys.set_suite(self.cipher_suite);
                         self.keys = Some(keys);
+                        self.sharded = false; // 新隧道：数据面回到单点，可再次拆分
                         self.state = State::Established;
                         self.bound_init = Some(body.to_vec());
                         let mut out = Vec::new();
@@ -330,6 +369,7 @@ impl Engine {
                 };
                 keys.set_suite(self.cipher_suite);
                 self.keys = Some(keys);
+                self.sharded = false;
                 self.state = State::Established;
                 None
             }
@@ -359,6 +399,7 @@ impl Engine {
                                 write_head(&mut out, FrameType::AuthResp, &[0u8; 8]);
                                 out.extend_from_slice(&resp_body);
                                 self.keys = Some(keys);
+                                self.sharded = false; // 新隧道：数据面回到单点，可再次拆分
                                 self.state = State::Established;
                                 self.bound_init = Some(body.to_vec());
                                 self.cached_resp = Some(out.clone());
@@ -390,6 +431,7 @@ impl Engine {
                     Ok(mut keys) => {
                         keys.set_suite(self.cipher_suite);
                         self.keys = Some(keys);
+                        self.sharded = false; // 新隧道：数据面回到单点，可再次拆分
                         self.state = State::Established;
                         self.last_auth_error = None;
                     }

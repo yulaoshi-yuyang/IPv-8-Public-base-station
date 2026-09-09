@@ -186,6 +186,12 @@ pub struct TunnelKeys {
     epoch_created: Instant,
     epoch_bytes: u64,
     tx_counter: u64,
+    /// 流级分片编号（ADR-026 性能线；0 = 非分片，与历史行为一致）
+    shard: u64,
+    /// epoch 推进步幅 = 分片总数（默认 1：逐代 +1，Phase 1-5 零回归）。
+    /// 分片 k 的 epoch 序列 ≡ k (mod stride)，接收端凭 `epoch % stride`
+    /// 无解密路由到对应分片 SA——线格式（KeyID/计数器/nonce）不变。
+    stride: u64,
     /// 各 epoch 的接收滑动窗口（仅保留最近 GRACE_EPOCHS+1 代）
     rx: BTreeMap<u64, RxWindow>,
 }
@@ -244,6 +250,8 @@ impl Clone for TunnelKeys {
             epoch_created: self.epoch_created,
             epoch_bytes: self.epoch_bytes,
             tx_counter: self.tx_counter,
+            shard: self.shard,
+            stride: self.stride,
             rx: self.rx.clone(),
         }
     }
@@ -260,6 +268,8 @@ impl TunnelKeys {
             epoch_created: Instant::now(),
             epoch_bytes: 0,
             tx_counter: 0,
+            shard: 0,
+            stride: 1,
             rx: BTreeMap::new(),
         }
     }
@@ -271,16 +281,58 @@ impl TunnelKeys {
         k
     }
 
+    /// 流级分片 SA 构造（ADR-026 性能线）：本实例只处理 `epoch ≡ shard
+    /// (mod stride)` 的帧，轮换时 epoch += stride。同一隧道的 N 个分片
+    /// 各持一个实例，跨线程无锁并发（每片内部仍是单线程计数器语义）。
+    /// 两端的 (shard, stride) 配置必须人工一致——不一致在 `open` 处
+    /// `ShardMismatch` 拒收，绝不误解密。
+    pub fn with_shard(dh: [u8; 32], is_initiator: bool, suite: CipherSuite, shard: u64, stride: u64) -> Self {
+        assert!(stride >= 1 && shard < stride, "分片配置要求 shard < stride 且 stride ≥ 1");
+        let mut k = Self::with_suite(dh, is_initiator, suite);
+        // epoch 0 恒属于分片 0；其余分片从自己的第一个同余代起算
+        k.shard = shard;
+        k.stride = stride;
+        k.send_epoch = shard; // shard ∈ [1, stride) 时首个合法 epoch
+        k
+    }
+
+    /// 本实例的分片号（非分片模式恒 0）
+    pub fn shard(&self) -> u64 {
+        self.shard
+    }
+
+    /// 本实例所属分片总数（非分片模式恒 1）
+    pub fn stride(&self) -> u64 {
+        self.stride
+    }
+
+    /// 从本 SA 派生同隧道的第 `shard` 个分片 SA（ADR-026 流级多核）：
+    /// 继承 dh / 套件 / 方向位，只换同余类起点。不导出任何密钥材料。
+    pub fn derive_shard(&self, shard: u64, stride: u64) -> Self {
+        assert!(stride >= 1 && shard < stride, "分片配置要求 shard < stride 且 stride ≥ 1");
+        let mut k = self.clone();
+        k.shard = shard;
+        k.stride = stride;
+        k.send_epoch = shard; // 本分片的第一个合法代（≡ shard mod stride）
+        k.epoch_created = Instant::now();
+        k.epoch_bytes = 0;
+        k.tx_counter = 0;
+        k.rx = BTreeMap::new();
+        k
+    }
+
     /// 本端使用的套件
     pub fn suite(&self) -> CipherSuite {
         self.suite
     }
 
-    /// 修改本端套件。仅允许在**首帧使用前**（epoch 0 且计数器为 0）调用——
+    /// 修改本端套件。仅允许在**首帧使用前**调用——
     /// 用于 Engine 在握手完成后应用部署配置（ADR-025：两端人工一致，不协商）。
     /// 已发过帧返回 false（防止半程改套件导致密钥链分裂）。
+    /// 判定用「epoch 仍在构造初值 + 计数器 0 + 接收窗空」，分片实例
+    /// （初值 send_epoch = shard，ADR-026）同样适用。
     pub fn set_suite(&mut self, suite: CipherSuite) -> bool {
-        if self.send_epoch != 0 || self.tx_counter != 0 || !self.rx.is_empty() {
+        if self.send_epoch != self.shard || self.tx_counter != 0 || !self.rx.is_empty() {
             return false;
         }
         self.suite = suite;
@@ -336,16 +388,22 @@ impl TunnelKeys {
         // KeyID 线格式 = suite(1) ‖ epoch 低 7 字节：掩掉首字节还原 epoch。
         // 默认套件下 key_id[0]==0，掩码是恒等 → 与 Phase 1-4 的 8B 大端逐字节一致。
         let epoch = u64::from_be_bytes(*key_id) & 0x00FF_FFFF_FFFF_FFFF;
+        // 流级分片路由（ADR-026）：epoch ≡ shard (mod stride)。非本片同余类
+        // 的帧直接拒收（配置漂移诊断），绝不跨片解密。stride=1 恒通过。
+        if epoch % self.stride != self.shard {
+            return Err(FrameError::ShardMismatch { epoch, shard: self.shard, stride: self.stride });
+        }
         if body.len() < 8 {
             return Err(FrameError::BodyTooShort);
         }
         let counter = u64::from_be_bytes(body[..8].try_into().unwrap());
         let ct = &body[8..];
 
-        // epoch 宽限窗口：不得比已见最新代旧超过 GRACE_EPOCHS
+        // epoch 宽限窗口：不得比已见最新代旧超过 GRACE_EPOCHS **代**
+        // （分片模式下相邻代相差 stride 个 epoch，宽限须按代换算）
         let max_seen = self.rx.keys().next_back().copied().unwrap_or(epoch);
         let newest = max_seen.max(epoch);
-        if newest > epoch.saturating_add(GRACE_EPOCHS) {
+        if newest > epoch.saturating_add(GRACE_EPOCHS.saturating_mul(self.stride)) {
             return Err(FrameError::StaleEpoch { epoch, newest });
         }
 
@@ -373,13 +431,14 @@ impl TunnelKeys {
     }
 
     fn prune(&mut self, newest: u64) {
-        let floor = newest.saturating_sub(GRACE_EPOCHS);
+        let floor = newest.saturating_sub(GRACE_EPOCHS.saturating_mul(self.stride));
         let keep = self.rx.split_off(&floor);
         self.rx = keep;
     }
 
     fn advance_epoch(&mut self) {
-        self.send_epoch += 1;
+        // 步幅 = 分片总数（默认 1）：各分片始终停留在自己的同余类内轮换
+        self.send_epoch += self.stride;
         self.epoch_created = Instant::now();
         self.epoch_bytes = 0;
         self.tx_counter = 0;
