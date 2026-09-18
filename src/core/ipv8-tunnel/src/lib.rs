@@ -13,6 +13,7 @@
 //! - [`tun_worker`]：独立读线程 + mpsc（v9 §8；设备经 TunIo 注入，CI 用 Mock）
 //! - [`flow`]：流级分片数据面（ADR-026 多核：N worker 并行 seal/open，epoch 同余类路由）
 
+pub mod abuse_guard;
 pub mod auth;
 pub mod crypto;
 pub mod engine;
@@ -21,6 +22,7 @@ pub mod fallback;
 pub mod flow;
 pub mod frame;
 pub mod handshake;
+pub mod relay_failover;
 pub mod tun_worker;
 
 pub use crypto::{Identity, TunnelKeys, GRACE_EPOCHS, ROTATE_BYTES, ROTATE_SECS};
@@ -37,4 +39,6 @@ pub use auth::{
 pub use engine::{Engine, EngineError, EngineStats, State};
 pub use fallback::{FallbackManager, FallbackOptions, Failure, Level, Path, Resolved};
 pub use flow::{hash_flow, FlowShards, ShardStats, Sink as ShardSink};
+pub use relay_failover::{RelayFailover, RelayNode, FailoverConfig, FailoverEvent, FailoverStats, Health as RelayHealth};
+pub use abuse_guard::{AbuseGuard, AbuseConfig, AbuseStats, BanLevel, Detection};
 pub use tun_worker::{mock_tun, ClosableMockTun, MockTun, MockTunHandle, TunError, TunIo, TunWorker};

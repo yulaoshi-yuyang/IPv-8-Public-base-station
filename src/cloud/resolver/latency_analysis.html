@@ -1,0 +1,1167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IPv8 Resolver 超低延迟深度分析</title>
+<style>
+  :root {
+    --bg: #0a0e17;
+    --bg2: #0f1623;
+    --bg3: #131c2e;
+    --fg: #e6edf3;
+    --fg2: #8b949e;
+    --accent: #58a6ff;
+    --accent2: #3fb950;
+    --warn: #d29922;
+    --danger: #f85149;
+    --purple: #bc8cff;
+    --border: #21262d;
+    --code-bg: #161b22;
+    --card: rgba(22, 27, 34, 0.8);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    line-height: 1.7;
+    overflow-x: hidden;
+  }
+  .container { max-width: 1200px; margin: 0 auto; padding: 40px 24px; }
+
+  /* Hero */
+  .hero {
+    text-align: center;
+    padding: 60px 24px 40px;
+    background: linear-gradient(135deg, #0a0e17 0%, #0f1623 50%, #131c2e 100%);
+    border-bottom: 1px solid var(--border);
+    position: relative;
+  }
+  .hero::after {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: radial-gradient(ellipse at center top, rgba(88,166,255,0.08), transparent 60%);
+    pointer-events: none;
+  }
+  .hero h1 {
+    font-size: 2.6rem;
+    font-weight: 800;
+    background: linear-gradient(135deg, #58a6ff, #bc8cff);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 12px;
+    position: relative;
+    z-index: 1;
+  }
+  .hero p {
+    color: var(--fg2);
+    font-size: 1.15rem;
+    position: relative;
+    z-index: 1;
+  }
+  .hero .stats-row {
+    display: flex;
+    justify-content: center;
+    gap: 32px;
+    margin-top: 32px;
+    flex-wrap: wrap;
+    position: relative;
+    z-index: 1;
+  }
+  .hero .stat-item {
+    text-align: center;
+  }
+  .hero .stat-value {
+    font-size: 2rem;
+    font-weight: 800;
+    color: var(--accent2);
+  }
+  .hero .stat-label {
+    font-size: 0.85rem;
+    color: var(--fg2);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  /* Section */
+  section {
+    margin-top: 56px;
+    padding-top: 8px;
+  }
+  section > h2 {
+    font-size: 1.8rem;
+    font-weight: 700;
+    color: var(--fg);
+    border-left: 4px solid var(--accent);
+    padding-left: 16px;
+    margin-bottom: 24px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  section > h2 .icon { font-size: 1.4rem; }
+
+  /* Cards */
+  .card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+    gap: 20px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    transition: border-color 0.3s, box-shadow 0.3s;
+  }
+  .card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 0 20px rgba(88,166,255,0.08);
+  }
+  .card h3 {
+    font-size: 1.15rem;
+    font-weight: 600;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .card .tag {
+    display: inline-block;
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .tag-critical { background: rgba(248,81,73,0.15); color: var(--danger); }
+  .tag-medium   { background: rgba(210,153,34,0.15); color: var(--warn); }
+  .tag-low      { background: rgba(63,185,80,0.15);  color: var(--accent2); }
+  .tag-info     { background: rgba(88,166,255,0.15); color: var(--accent); }
+  .tag-purple   { background: rgba(188,140,255,0.15); color: var(--purple); }
+
+  .metric-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 6px 0;
+    border-bottom: 1px solid rgba(33,38,45,0.5);
+    font-size: 0.92rem;
+  }
+  .metric-row:last-child { border-bottom: none; }
+  .metric-label { color: var(--fg2); }
+  .metric-value { font-weight: 600; font-family: "Cascadia Code", "Fira Code", monospace; }
+  .metric-value.good { color: var(--accent2); }
+  .metric-value.bad  { color: var(--danger); }
+  .metric-value.warn { color: var(--warn); }
+
+  /* Code block */
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    overflow-x: auto;
+    margin: 12px 0;
+    font-size: 0.85rem;
+    line-height: 1.5;
+  }
+  code {
+    font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
+    color: var(--fg);
+  }
+  .inline-code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "Cascadia Code", monospace;
+    font-size: 0.88rem;
+    color: var(--accent);
+  }
+
+  /* Bottleneck table */
+  .bottleneck-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 0.88rem;
+  }
+  .bottleneck-table th {
+    text-align: left;
+    padding: 10px 14px;
+    background: var(--bg3);
+    color: var(--fg2);
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 2px solid var(--border);
+  }
+  .bottleneck-table td {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .bottleneck-table tr:hover td {
+    background: rgba(88,166,255,0.03);
+  }
+  .bottleneck-table .col-loc { color: var(--purple); font-family: monospace; white-space: nowrap; }
+  .bottleneck-table .col-cost { font-family: monospace; font-weight: 600; }
+  .bottleneck-table .col-cost.high { color: var(--danger); }
+  .bottleneck-table .col-cost.mid   { color: var(--warn); }
+  .bottleneck-table .col-cost.low   { color: var(--accent2); }
+
+  /* Timeline */
+  .timeline {
+    position: relative;
+    padding-left: 40px;
+  }
+  .timeline::before {
+    content: '';
+    position: absolute;
+    left: 16px;
+    top: 0; bottom: 0;
+    width: 2px;
+    background: linear-gradient(to bottom, var(--accent), var(--purple), var(--accent2));
+  }
+  .timeline-item {
+    position: relative;
+    margin-bottom: 24px;
+    padding: 16px 20px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+  .timeline-item::before {
+    content: '';
+    position: absolute;
+    left: -31px;
+    top: 20px;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--accent);
+    border: 2px solid var(--bg);
+  }
+  .timeline-item h4 {
+    font-size: 1.05rem;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+  .timeline-item .phase {
+    display: inline-block;
+    font-size: 0.7rem;
+    padding: 2px 8px;
+    border-radius: 4px;
+    margin-left: 8px;
+    vertical-align: middle;
+  }
+
+  /* Comparison */
+  .comparison {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin: 16px 0;
+  }
+  .comparison-col {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+  }
+  .comparison-col.current { border-color: rgba(248,81,73,0.3); }
+  .comparison-col.optimized { border-color: rgba(63,185,80,0.3); }
+  .comparison-col h4 {
+    font-size: 1rem;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  /* Benchmark bars */
+  .bench-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 8px 0;
+  }
+  .bench-bar .label {
+    width: 180px;
+    font-size: 0.85rem;
+    color: var(--fg2);
+    text-align: right;
+    flex-shrink: 0;
+  }
+  .bench-bar .bar-container {
+    flex: 1;
+    height: 24px;
+    background: var(--bg3);
+    border-radius: 4px;
+    overflow: hidden;
+    position: relative;
+  }
+  .bench-bar .bar {
+    height: 100%;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    padding-right: 8px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    white-space: nowrap;
+    transition: width 0.6s ease;
+  }
+  .bar-red    { background: linear-gradient(90deg, rgba(248,81,73,0.3), var(--danger)); }
+  .bar-orange { background: linear-gradient(90deg, rgba(210,153,34,0.3), var(--warn)); }
+  .bar-green  { background: linear-gradient(90deg, rgba(63,185,80,0.3), var(--accent2)); }
+  .bar-blue   { background: linear-gradient(90deg, rgba(88,166,255,0.3), var(--accent)); }
+  .bar-purple { background: linear-gradient(90deg, rgba(188,140,255,0.3), var(--purple)); }
+
+  /* Priority matrix */
+  .matrix {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 12px;
+    margin: 16px 0;
+  }
+  .matrix-cell {
+    padding: 16px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    min-height: 80px;
+  }
+  .matrix-cell.p0 { border-color: var(--danger); background: rgba(248,81,73,0.05); }
+  .matrix-cell.p1 { border-color: var(--warn); background: rgba(210,153,34,0.05); }
+  .matrix-cell.p2 { border-color: var(--accent2); background: rgba(63,185,80,0.05); }
+  .matrix-cell h5 {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 8px;
+    color: var(--fg2);
+  }
+  .matrix-cell ul {
+    list-style: none;
+    font-size: 0.85rem;
+  }
+  .matrix-cell li {
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(33,38,45,0.3);
+  }
+  .matrix-cell li:last-child { border-bottom: none; }
+
+  /* Footer */
+  footer {
+    margin-top: 60px;
+    padding: 24px;
+    text-align: center;
+    border-top: 1px solid var(--border);
+    color: var(--fg2);
+    font-size: 0.85rem;
+  }
+
+  /* Responsive */
+  @media (max-width: 768px) {
+    .card-grid { grid-template-columns: 1fr; }
+    .comparison { grid-template-columns: 1fr; }
+    .matrix { grid-template-columns: 1fr; }
+    .hero h1 { font-size: 1.8rem; }
+    .bench-bar .label { width: 120px; font-size: 0.75rem; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Hero -->
+<div class="hero">
+  <h1>IPv8 Resolver 超低延迟深度分析</h1>
+  <p>CachedStore 读路径性能解剖 → 业界最佳实践对标 → 优化路线图</p>
+  <div class="stats-row">
+    <div class="stat-item">
+      <div class="stat-value">~450ns</div>
+      <div class="stat-label">当前命中延迟（估算）</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value">~80ns</div>
+      <div class="stat-label">优化后目标</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value">5.6x</div>
+      <div class="stat-label">提升倍数</div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-value">9</div>
+      <div class="stat-label">已识别瓶颈</div>
+    </div>
+  </div>
+</div>
+
+<div class="container">
+
+<!-- Section 1: 当前架构瓶颈解剖 -->
+<section>
+  <h2><span class="icon">1</span> 当前 CachedStore 读路径瓶颈解剖</h2>
+  <p style="color: var(--fg2); margin-bottom: 20px;">逐行分析 <code class="inline-code">get()</code> 热路径，量化每次操作的纳秒级开销。</p>
+
+  <table class="bottleneck-table">
+    <thead>
+      <tr>
+        <th style="width:5%">#</th>
+        <th style="width:18%">代码位置</th>
+        <th style="width:15%">操作</th>
+        <th style="width:12%">估算延迟</th>
+        <th style="width:8%">严重度</th>
+        <th>分析</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td class="col-loc">borrow_mut()</td>
+        <td>RefCell 借用检查</td>
+        <td class="col-cost low">~2ns</td>
+        <td><span class="tag tag-low">低</span></td>
+        <td>运行时检查 <code>is_borrowed</code> 标志位。单线程无竞争，但每次 get() 必付。</td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td class="col-loc">contains_key(addr)</td>
+        <td>HashMap 查找 #1</td>
+        <td class="col-cost high">~80-120ns</td>
+        <td><span class="tag tag-critical">严重</span></td>
+        <td>std HashMap 默认用 SipHash-1-3（DoS 防护），每次哈希计算 ~80ns。IPv8Address 是 128-bit 值，哈希开销在此量级。</td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td class="col-loc">cache.get(addr).unwrap()</td>
+        <td>HashMap 查找 #2</td>
+        <td class="col-cost high">~80-120ns</td>
+        <td><span class="tag tag-critical">严重</span></td>
+        <td>命中后再次查找取值——重复计算哈希。应改用 <code>entry()</code> 或 <code>get_key_value</code> 合并。</td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td class="col-loc">entry.clone()</td>
+        <td>深拷贝 Entry</td>
+        <td class="col-cost high">~150-300ns</td>
+        <td><span class="tag tag-critical">严重</span></td>
+        <td>Entry 含 NodeRecord，其中 <code>tunnel_entry: String</code>（堆分配 + memcpy）、<code>alt_entries: Vec&lt;String&gt;</code>、<code>local_candidates: Vec&lt;String&gt;</code>——每次命中都深拷贝。</td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td class="col-loc">get_mut(addr)</td>
+        <td>HashMap 查找 #3</td>
+        <td class="col-cost high">~80-120ns</td>
+        <td><span class="tag tag-critical">严重</span></td>
+        <td>第三次哈希查找，仅为更新 <code>last_access</code>。三次查找 = 3x 哈希计算 = ~240-360ns 浪费。</td>
+      </tr>
+      <tr>
+        <td>6</td>
+        <td class="col-loc">Instant::now()</td>
+        <td>系统时钟读取</td>
+        <td class="col-cost mid">~15-30ns</td>
+        <td><span class="tag tag-medium">中</span></td>
+        <td>仅在负缓存路径触发。Windows 上 <code>QueryPerformanceCounter</code> 系统调用。正命中路径不触发，但负缓存路径每次必付。</td>
+      </tr>
+      <tr>
+        <td>7</td>
+        <td class="col-loc">clock.wrapping_add(1)</td>
+        <td>逻辑时钟更新</td>
+        <td class="col-cost low">~1ns</td>
+        <td><span class="tag tag-low">低</span></td>
+        <td>整数加法，可忽略。但配合 #5 的查找，整体路径变长。</td>
+      </tr>
+      <tr>
+        <td>8</td>
+        <td class="col-loc">evict_if_needed (写入路径)</td>
+        <td>O(n) 全表扫描</td>
+        <td class="col-cost mid">~5-50µs</td>
+        <td><span class="tag tag-medium">中</span></td>
+        <td>仅在超容量时触发（写入路径），读路径零开销。但 10K 条目时单次淘汰扫描 ~50µs，批量写入会形成延迟尖峰。</td>
+      </tr>
+      <tr>
+        <td>9</td>
+        <td class="col-loc">stats.clone()</td>
+        <td>统计快照拷贝</td>
+        <td class="col-cost low">~5ns</td>
+        <td><span class="tag tag-low">低</span></td>
+        <td>4 个 u64 = 32 bytes memcpy。非热路径（仅在查询 stats 时），不影响 get()。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div style="margin-top: 24px;">
+    <h3 style="color: var(--danger); margin-bottom: 12px;">读路径延迟分解（缓存命中场景）</h3>
+    <div class="bench-bar">
+      <div class="label">RefCell borrow_mut</div>
+      <div class="bar-container"><div class="bar bar-green" style="width: 3%;">2ns</div></div>
+    </div>
+    <div class="bench-bar">
+      <div class="label">contains_key (SipHash)</div>
+      <div class="bar-container"><div class="bar bar-red" style="width: 25%;">100ns</div></div>
+    </div>
+    <div class="bench-bar">
+      <div class="label">get().unwrap() (重复哈希)</div>
+      <div class="bar-container"><div class="bar bar-red" style="width: 25%;">100ns</div></div>
+    </div>
+    <div class="bench-bar">
+      <div class="label">Entry clone (堆分配)</div>
+      <div class="bar-container"><div class="bar bar-red" style="width: 40%;">200ns</div></div>
+    </div>
+    <div class="bench-bar">
+      <div class="label">get_mut (第三次哈希)</div>
+      <div class="bar-container"><div class="bar bar-red" style="width: 25%;">100ns</div></div>
+    </div>
+    <div class="bench-bar">
+      <div class="label">clock + return</div>
+      <div class="bar-container"><div class="bar bar-green" style="width: 3%;">2ns</div></div>
+    </div>
+    <div style="margin-top: 16px; padding: 12px 16px; background: rgba(248,81,73,0.08); border-radius: 8px; border: 1px solid rgba(248,81,73,0.2);">
+      <strong style="color: var(--danger);">总计 ≈ 504ns</strong> — 三次哈希查找（~300ns）+ 深拷贝（~200ns）占 99%
+    </div>
+  </div>
+</section>
+
+<!-- Section 2: 业界对标 -->
+<section>
+  <h2><span class="icon">2</span> 业界超低延迟方案对标</h2>
+
+  <div class="card-grid">
+    <div class="card">
+      <h3>hashbrown + aHash <span class="tag tag-info">Rust</span></h3>
+      <p style="color: var(--fg2); font-size: 0.9rem; margin-bottom: 12px;">SwissTable 设计，SIMD 加速指纹匹配，AES-NI 哈希</p>
+      <div class="metric-row">
+        <span class="metric-label">哈希计算</span>
+        <span class="metric-value good">~5-10ns</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">vs SipHash-1-3</span>
+        <span class="metric-value good">8-15x 更快</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">CPI (3GHz)</span>
+        <span class="metric-value">1.0</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">生产就绪</span>
+        <span class="metric-value good">高</span>
+      </div>
+      <p style="margin-top: 12px; font-size: 0.85rem; color: var(--fg2);">std HashMap 内部已用 hashbrown，但默认哈希器仍是 SipHash。切换 aHash 可在保持 SwissTable 查找的同时加速哈希计算。</p>
+    </div>
+
+    <div class="card">
+      <h3>SLRU 缓存 <span class="tag tag-purple">算法</span></h3>
+      <p style="color: var(--fg2); font-size: 0.9rem; margin-bottom: 12px;">分段 LRU，热冷分区，抗扫描污染</p>
+      <div class="metric-row">
+        <span class="metric-label">GET 延迟</span>
+        <span class="metric-value good">40-260ns</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">吞吐</span>
+        <span class="metric-value good">8-12M ops/s</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">命中率</span>
+        <span class="metric-value good">优秀</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">vs 纯 LRU</span>
+        <span class="metric-value good">命中率 +10-20%</span>
+      </div>
+      <p style="margin-top: 12px; font-size: 0.85rem; color: var(--fg2);">热区保护高频 key 不被扫描驱逐。当前实现用逻辑时钟 O(n) 扫描淘汰，SLRU 可在 O(1) 淘汰的同时提升命中率。</p>
+    </div>
+
+    <div class="card">
+      <h3>Arena 分配器 <span class="tag tag-info">内存</span></h3>
+      <p style="color: var(--fg2); font-size: 0.9rem; margin-bottom: 12px;">bumpalo / arena-b，连续内存批量回收</p>
+      <div class="metric-row">
+        <span class="metric-label">单次分配</span>
+        <span class="metric-value good">~4.7ns</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">vs Box::new</span>
+        <span class="metric-value good">~9x 更快</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">碎片</span>
+        <span class="metric-value good">无</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">适用场景</span>
+        <span class="metric-value">Entry clone</span>
+      </div>
+      <p style="margin-top: 12px; font-size: 0.85rem; color: var(--fg2);">当前每次命中深拷贝 Entry 含 String 堆分配 ~200ns。用 arena 可将分配降至 ~5ns，但需解决生命周期管理。</p>
+    </div>
+
+    <div class="card">
+      <h3>mimalloc <span class="tag tag-info">系统级</span></h3>
+      <p style="color: var(--fg2); font-size: 0.9rem; margin-bottom: 12px;">微软官方全局分配器替代</p>
+      <div class="metric-row">
+        <span class="metric-label">多线程分配</span>
+        <span class="metric-value good">5.3x 提升</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">RSS 减少</span>
+        <span class="metric-value good">~50%</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">Windows 兼容</span>
+        <span class="metric-value good">是</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">接入方式</span>
+        <span class="metric-value">#[global_allocator]</span>
+      </div>
+      <p style="margin-top: 12px; font-size: 0.85rem; color: var(--fg2);">一行代码全局替换，所有堆分配受益。尤其减少 String/Vec 分配尾延迟。</p>
+    </div>
+
+    <div class="card">
+      <h3>DashMap 分片 <span class="tag tag-purple">并发</span></h3>
+      <p style="color: var(--fg2); font-size: 0.9rem; margin-bottom: 12px;">分片锁，无全局争用</p>
+      <div class="metric-row">
+        <span class="metric-label">读延迟</span>
+        <span class="metric-value good">&lt;1µs</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">vs Mutex HashMap</span>
+        <span class="metric-value good">2-4x 更快</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">当前瓶颈</span>
+        <span class="metric-value warn">RefCell 不可并发</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">128B 对齐</span>
+        <span class="metric-value">防 false sharing</span>
+      </div>
+      <p style="margin-top: 12px; font-size: 0.85rem; color: var(--fg2);">当前 RefCell 不可跨线程。若后续多线程 gRPC，需切 DashMap。128 字节对齐防止 Intel 相邻行预取导致的伪共享。</p>
+    </div>
+
+    <div class="card">
+      <h3>SmallVec 栈上分配 <span class="tag tag-info">内存</span></h3>
+      <p style="color: var(--fg2); font-size: 0.9rem; margin-bottom: 12px;">短 Vec/String 不上堆</p>
+      <div class="metric-row">
+        <span class="metric-label">空 Vec 分配</span>
+        <span class="metric-value warn">~40ns → 0ns</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">alt_entries (空)</span>
+        <span class="metric-value good">栈上</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">local_candidates (空)</span>
+        <span class="metric-value good">栈上</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">clone 开销</span>
+        <span class="metric-value good">大幅减少</span>
+      </div>
+      <p style="margin-top: 12px; font-size: 0.85rem; color: var(--fg2);">NodeRecord 的 alt_entries 和 local_candidates 在大多数节点为空 Vec，但每次 clone 仍触发堆分配。SmallVec/ArrayVec 可将空/小 Vec 完全放栈上。</p>
+    </div>
+  </div>
+</section>
+
+<!-- Section 3: 对比分析 -->
+<section>
+  <h2><span class="icon">3</span> 当前实现 vs 优化后对比</h2>
+
+  <div class="comparison">
+    <div class="comparison-col current">
+      <h4>🔴 当前实现</h4>
+      <pre><code>fn get(&self, addr: &IPv8Address) -> Option&lt;Entry&gt; {
+    let mut state = self.state.borrow_mut();
+
+    // 第1次哈希: SipHash ~100ns
+    if state.cache.contains_key(addr) {
+        state.stats.hits += 1;
+        state.clock = state.clock.wrapping_add(1);
+        let clock = state.clock;
+
+        // 第2次哈希: SipHash ~100ns
+        let entry = state.cache.get(addr)
+            .unwrap().entry.clone();
+        //        ^^^^^ 深拷贝 ~200ns
+        //        (String + Vec&lt;String&gt; x2)
+
+        // 第3次哈希: SipHash ~100ns
+        if let Some(existing) = state.cache.get_mut(addr) {
+            existing.last_access = clock;
+        }
+        return Some(entry);
+    }
+    // 总计: ~504ns (命中路径)
+}</code></pre>
+    </div>
+    <div class="comparison-col optimized">
+      <h4>🟢 优化后实现</h4>
+      <pre><code>fn get(&self, addr: &IPv8Address) -> Option&lt;Entry&gt; {
+    let mut state = self.state.borrow_mut();
+
+    // 单次哈希: aHash ~8ns + entry() 原子操作
+    if let Some(ce) = state.cache.get_mut(addr) {
+        state.stats.hits += 1;
+        state.clock = state.clock.wrapping_add(1);
+        ce.last_access = state.clock;
+
+        // Arc 共享指针 clone ~5ns
+        // 或 SmallVec 栈上拷贝 ~20ns
+        return Some(ce.entry.clone());
+    }
+    // 总计: ~33-53ns (命中路径)
+    // 提升: ~10-15x
+}</code></pre>
+    </div>
+  </div>
+
+  <h3 style="color: var(--accent); margin: 24px 0 12px;">关键差异</h3>
+  <table class="bottleneck-table">
+    <thead>
+      <tr><th>维度</th><th>当前</th><th>优化后</th><th>提升</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>哈希查找次数</td>
+        <td class="col-cost high">3 次</td>
+        <td class="col-cost good">1 次</td>
+        <td><span class="tag tag-low">3x</span></td>
+      </tr>
+      <tr>
+        <td>哈希算法</td>
+        <td>SipHash-1-3 (~100ns)</td>
+        <td class="col-cost good">aHash/AES-NI (~8ns)</td>
+        <td><span class="tag tag-low">12x</span></td>
+      </tr>
+      <tr>
+        <td>Entry clone</td>
+        <td>深拷贝 String+Vec (~200ns)</td>
+        <td class="col-cost good">Arc/SmallVec (~20ns)</td>
+        <td><span class="tag tag-low">10x</span></td>
+      </tr>
+      <tr>
+        <td>LRU 淘汰</td>
+        <td>O(n) 全表扫描</td>
+        <td class="col-cost good">O(1) 链表弹出</td>
+        <td><span class="tag tag-low">~1000x</span></td>
+      </tr>
+      <tr>
+        <td>分配器</td>
+        <td>Windows 默认</td>
+        <td class="col-cost good">mimalloc</td>
+        <td><span class="tag tag-low">~5x</span></td>
+      </tr>
+      <tr>
+        <td>总命中延迟</td>
+        <td class="col-cost high">~504ns</td>
+        <td class="col-cost good">~53ns</td>
+        <td><span class="tag tag-low">9.5x</span></td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- Section 4: 优化路线图 -->
+<section>
+  <h2><span class="icon">4</span> 优化路线图（按优先级）</h2>
+
+  <div class="matrix">
+    <div class="matrix-cell p0">
+      <h5>P0 — 立即收益</h5>
+      <ul>
+        <li><strong>合并三次哈希</strong>：用 <code>get_mut()</code> 一次完成查找+更新</li>
+        <li><strong>切换 aHash</strong>：替换 SipHash，~12x 哈希加速</li>
+        <li><strong>Arc&lt;Entry&gt;</strong>：clone 从 ~200ns → ~5ns</li>
+      </ul>
+    </div>
+    <div class="matrix-cell p1">
+      <h5>P1 — 中等收益</h5>
+      <ul>
+        <li><strong>SmallVec</strong>：空 Vec 栈上化，减少堆分配</li>
+        <li><strong>mimalloc</strong>：全局分配器替换</li>
+        <li><strong>LRU O(1) 淘汰</strong>：双向链表 + HashMap</li>
+        <li><strong>likely/unlikely</strong>：分支预测提示</li>
+      </ul>
+    </div>
+    <div class="matrix-cell p2">
+      <h5>P2 — 长期演进</h5>
+      <ul>
+        <li><strong>DashMap 分片</strong>：多线程并发读</li>
+        <li><strong>SLRU 热冷分区</strong>：命中率提升</li>
+        <li><strong>prefetch 指令</strong>：CPU 预取</li>
+        <li><strong>NUMA/CPU 绑核</strong>：系统级</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- Timeline -->
+  <h3 style="color: var(--accent); margin: 32px 0 16px;">实施时间线</h3>
+  <div class="timeline">
+    <div class="timeline-item">
+      <h4>P0: 合并哈希 + 切换 aHash <span class="phase tag tag-critical">预计 2h</span></h4>
+      <p style="color: var(--fg2); font-size: 0.9rem;">将 <code>contains_key + get + get_mut</code> 三次查找合并为单次 <code>get_mut</code>。替换 <code>std::collections::HashMap</code> 为 <code>hashbrown::HashMap&lt;K, V, ahash::ABuilder&gt;</code> 或直接用 <code>ahash::AHashMap</code>。</p>
+      <div class="metric-row">
+        <span class="metric-label">预计延迟降低</span>
+        <span class="metric-value good">504ns → ~120ns</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">改动范围</span>
+        <span class="metric-value">cached_store.rs + Cargo.toml</span>
+      </div>
+    </div>
+    <div class="timeline-item">
+      <h4>P0: Arc&lt;Entry&gt; 共享指针 <span class="phase tag tag-critical">预计 1h</span></h4>
+      <p style="color: var(--fg2); font-size: 0.9rem;">将 <code>CacheEntry.entry: Entry</code> 改为 <code>CacheEntry.entry: Arc&lt;Entry&gt;</code>。命中时 <code>Arc::clone()</code> 仅原子引用计数 +1（~5ns），不做深拷贝。Store trait 的 <code>get</code> 返回类型改为 <code>Arc&lt;Entry&gt;</code>。</p>
+      <div class="metric-row">
+        <span class="metric-label">预计延迟降低</span>
+        <span class="metric-value good">120ns → ~30ns</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">改动范围</span>
+        <span class="metric-value">lib.rs (Store trait) + cached_store.rs + 调用方</span>
+      </div>
+    </div>
+    <div class="timeline-item">
+      <h4>P1: SmallVec + mimalloc <span class="phase tag tag-medium">预计 3h</span></h4>
+      <p style="color: var(--fg2); font-size: 0.9rem;">NodeRecord 的 <code>alt_entries</code> 和 <code>local_candidates</code> 改为 <code>SmallVec&lt;[String; 4]&gt;</code>。同时引入 mimalloc 全局分配器。空 Vec 从 ~40ns 堆分配 → 0ns 栈上。所有 String 分配经 mimalloc 加速。</p>
+      <div class="metric-row">
+        <span class="metric-label">预计延迟降低</span>
+        <span class="metric-value warn">30ns → ~25ns</span>
+      </div>
+    </div>
+    <div class="timeline-item">
+      <h4>P1: LRU O(1) 淘汰 <span class="phase tag tag-medium">预计 4h</span></h4>
+      <p style="color: var(--fg2); font-size: 0.9rem;">当前 <code>min_by_key</code> 全表扫描 O(n)。改用双向链表 + HashMap 的经典 LRU：HashMap 存 key → 链表节点指针，淘汰时弹出链表尾部 O(1)。10K 条目时从 ~50µs → ~10ns。</p>
+      <div class="metric-row">
+        <span class="metric-label">淘汰延迟（10K 条目）</span>
+        <span class="metric-value good">~50µs → ~10ns</span>
+      </div>
+    </div>
+    <div class="timeline-item">
+      <h4>P2: DashMap + SLRU <span class="phase tag tag-low">预计 8h</span></h4>
+      <p style="color: var(--fg2); font-size: 0.9rem;">引入 DashMap 替代 RefCell+HashMap，实现多线程并发读。升级 LRU 为 SLRU（热冷分区），提升命中率 10-20%。128 字节对齐防止 false sharing。</p>
+      <div class="metric-row">
+        <span class="metric-label">并发读延迟</span>
+        <span class="metric-value good">&lt;1µs (多线程)</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Section 5: 具体代码优化方案 -->
+<section>
+  <h2><span class="icon">5</span> P0 具体代码方案</h2>
+
+  <h3 style="color: var(--accent); margin-bottom: 12px;">优化1: 合并三次哈希 → 单次 get_mut</h3>
+  <div class="comparison">
+    <div class="comparison-col current">
+      <h4>当前：3 次哈希</h4>
+<pre><code>// 第1次哈希
+if state.cache.contains_key(addr) {
+    state.stats.hits += 1;
+    // 第2次哈希
+    let entry = state.cache
+        .get(addr).unwrap()
+        .entry.clone();
+    // 第3次哈希
+    if let Some(existing) =
+        state.cache.get_mut(addr) {
+        existing.last_access = clock;
+    }
+    return Some(entry);
+}</code></pre>
+    </div>
+    <div class="comparison-col optimized">
+      <h4>优化后：1 次哈希</h4>
+<pre><code>// 单次哈希，同时拿引用
+if let Some(ce) = state.cache.get_mut(addr) {
+    state.stats.hits += 1;
+    state.clock = state.clock
+        .wrapping_add(1);
+    ce.last_access = state.clock;
+    return Some(ce.entry.clone());
+}</code></pre>
+    </div>
+  </div>
+
+  <h3 style="color: var(--accent); margin: 24px 0 12px;">优化2: aHash 替换 SipHash</h3>
+  <pre><code>// Cargo.toml
+// [dependencies]
+// ahash = "0.8"
+// hashbrown = "0.14"  // 或直接用 ahash::AHashMap
+
+use ahash::AHashMap;
+
+struct CacheState {
+    cache: AHashMap&lt;IPv8Address, CacheEntry&gt;,  // AES-NI 加速
+    negative: AHashMap&lt;IPv8Address, Instant&gt;,
+    stats: CacheStats,
+    clock: u64,
+}
+
+// 哈希计算: SipHash ~100ns → aHash ~8ns (AES-NI)
+// 查找效率: SwissTable SIMD 16 槽位并行比较</code></pre>
+
+  <h3 style="color: var(--accent); margin: 24px 0 12px;">优化3: Arc&lt;Entry&gt; 替代深拷贝</h3>
+  <pre><code>use std::sync::Arc;
+
+struct CacheEntry {
+    entry: Arc&lt;Entry&gt;,  // 共享指针，clone 仅 +1 引用计数
+    last_access: u64,
+}
+
+// Store trait 改动
+pub trait Store {
+    fn get(&self, addr: &IPv8Address) -> Option&lt;Arc&lt;Entry&gt;&gt;;
+    //                                  ^^^^^^^^^^^^
+    //                                  Arc clone: ~5ns
+    //                                  vs Entry clone: ~200ns
+}
+
+// 写通路径
+fn insert(&mut self, addr: IPv8Address, e: Entry) {
+    let arc = Arc::new(e);  // 一次分配
+    self.inner.insert(addr, Arc::clone(&arc));
+    state.cache.insert(addr, CacheEntry {
+        entry: arc,
+        last_access: clock,
+    });
+}</code></pre>
+
+  <h3 style="color: var(--accent); margin: 24px 0 12px;">优化4: SmallVec 栈上化空集合</h3>
+  <pre><code>use smallvec::SmallVec;
+
+pub struct NodeRecord {
+    pub tunnel_entry: String,
+    // 90%+ 节点 alt_entries 为空 → 栈上，零分配
+    pub alt_entries: SmallVec&lt;[String; 4]&gt;,
+    pub ipv8_capable: bool,
+    pub mtu: u32,
+    pub registered_at: Instant,
+    pub ttl: Duration,
+    pub observed: Option&lt;(String, Instant)&gt;,
+    // 同理，大部分节点为空
+    pub local_candidates: SmallVec&lt;[String; 4]&gt;,
+}
+
+// clone 空集合: ~40ns → 0ns (栈上 memcpy)
+// clone 非空集合: 仍堆分配，但 4 条以内不触发</code></pre>
+
+  <h3 style="color: var(--accent); margin: 24px 0 12px;">优化5: mimalloc 全局分配器</h3>
+  <pre><code>// Cargo.toml (workspace 级)
+// [dependencies]
+// mimalloc = "0.1"
+
+// src/main.rs 或 src/lib.rs
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+// 效果：
+// - 多线程分配: 5.3x 加速
+// - RSS: 减少 ~50%
+// - 小对象分配尾延迟大幅降低
+// - 对 String/Vec 构造/释放链路全局生效</code></pre>
+
+  <h3 style="color: var(--accent); margin: 24px 0 12px;">优化6: 分支预测提示</h3>
+  <pre><code>// 使用 branches crate (stable Rust)
+use branches::likely;
+
+fn get(&self, addr: &IPv8Address) -> Option&lt;Arc&lt;Entry&gt;&gt; {
+    let mut state = self.state.borrow_mut();
+
+    // 缓存命中是高频路径 → likely
+    if likely!(state.cache.contains_key(addr)) {
+        // ... 快速返回
+    }
+
+    // 负缓存命中是中频路径
+    // 底层穿透是低频路径 → unlikely
+    // 编译器会将冷路径代码放到远处，保持 icache 热度
+}</code></pre>
+</section>
+
+<!-- Section 6: 延迟预期 -->
+<section>
+  <h2><span class="icon">6</span> 优化后延迟预期</h2>
+
+  <div class="card-grid">
+    <div class="card" style="border-color: var(--accent2);">
+      <h3>P0 完成后命中路径</h3>
+      <div class="metric-row">
+        <span class="metric-label">RefCell borrow</span>
+        <span class="metric-value">2ns</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">aHash + get_mut (1次)</span>
+        <span class="metric-value good">~20ns</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">Arc clone</span>
+        <span class="metric-value good">~5ns</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">clock + return</span>
+        <span class="metric-value">2ns</span>
+      </div>
+      <div class="metric-row" style="border-top: 2px solid var(--border); padding-top: 8px;">
+        <span class="metric-label" style="font-weight: 700;">总计</span>
+        <span class="metric-value good" style="font-size: 1.2rem;">~29ns</span>
+      </div>
+      <div style="margin-top: 8px; font-size: 0.85rem; color: var(--accent2);">vs 当前 504ns = <strong>17.4x 提升</strong></div>
+    </div>
+
+    <div class="card" style="border-color: var(--warn);">
+      <h3>P0+P1 完成后命中路径</h3>
+      <div class="metric-row">
+        <span class="metric-label">RefCell borrow</span>
+        <span class="metric-value">2ns</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">aHash + get_mut</span>
+        <span class="metric-value good">~20ns</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">Arc clone (SmallVec)</span>
+        <span class="metric-value good">~5ns</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">mimalloc 辅助</span>
+        <span class="metric-value good">-2ns</span>
+      </div>
+      <div class="metric-row" style="border-top: 2px solid var(--border); padding-top: 8px;">
+        <span class="metric-label" style="font-weight: 700;">总计</span>
+        <span class="metric-value good" style="font-size: 1.2rem;">~25ns</span>
+      </div>
+      <div style="margin-top: 8px; font-size: 0.85rem; color: var(--warn);">vs 当前 504ns = <strong>20.2x 提升</strong></div>
+    </div>
+
+    <div class="card" style="border-color: var(--purple);">
+      <h3>P2 完成后命中路径</h3>
+      <div class="metric-row">
+        <span class="metric-label">DashMap shard 读锁</span>
+        <span class="metric-value good">~15ns</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">aHash + get_mut</span>
+        <span class="metric-value good">~20ns</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">Arc clone</span>
+        <span class="metric-value good">~5ns</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">SLRU 热区 (无淘汰)</span>
+        <span class="metric-value good">0ns</span>
+      </div>
+      <div class="metric-row" style="border-top: 2px solid var(--border); padding-top: 8px;">
+        <span class="metric-label" style="font-weight: 700;">总计</span>
+        <span class="metric-value good" style="font-size: 1.2rem;">~40ns</span>
+      </div>
+      <div style="margin-top: 8px; font-size: 0.85rem; color: var(--purple);">多线程并发读 = <strong>12.6x 提升 + 可扩展</strong></div>
+    </div>
+  </div>
+
+  <!-- 延迟对比柱状图 -->
+  <h3 style="color: var(--accent); margin: 32px 0 16px;">延迟对比（对数刻度）</h3>
+  <div class="bench-bar">
+    <div class="label">当前实现</div>
+    <div class="bar-container"><div class="bar bar-red" style="width: 100%;">504ns</div></div>
+  </div>
+  <div class="bench-bar">
+    <div class="label">P0: 合并+aHash+Arc</div>
+    <div class="bar-container"><div class="bar bar-orange" style="width: 5.8%;">29ns</div></div>
+  </div>
+  <div class="bench-bar">
+    <div class="label">P0+P1: +SmallVec+mimalloc</div>
+    <div class="bar-container"><div class="bar bar-green" style="width: 5.0%;">25ns</div></div>
+  </div>
+  <div class="bench-bar">
+    <div class="label">P2: +DashMap+SLRU (并发)</div>
+    <div class="bar-container"><div class="bar bar-purple" style="width: 7.9%;">40ns</div></div>
+  </div>
+  <div class="bench-bar">
+    <div class="label">业界 LRU 基线 (dash_cache)</div>
+    <div class="bar-container"><div class="bar bar-blue" style="width: 3.8%;">~20ns</div></div>
+  </div>
+  <div class="bench-bar">
+    <div class="label">业界 LRU 基线 (SLRU)</div>
+    <div class="bar-container"><div class="bar bar-blue" style="width: 7.9%;">40ns</div></div>
+  </div>
+</section>
+
+<!-- Section 7: 生产参考 -->
+<section>
+  <h2><span class="icon">7</span> 生产系统参考</h2>
+  <div class="card-grid">
+    <div class="card">
+      <h3>Cloudflare 1.1.1.1</h3>
+      <p style="color: var(--fg2); font-size: 0.9rem;">全球 DNS 解析，330+ 城市边缘节点 Anycast 就近接入。北美 ~7ms，亚洲 ~15ms。核心策略：边缘缓存 + Anycast。</p>
+      <div class="metric-row">
+        <span class="metric-label">缓存吸收率</span>
+        <span class="metric-value good">~90%</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">负缓存 TTL</span>
+        <span class="metric-value">30s 基线</span>
+      </div>
+      <p style="font-size: 0.8rem; color: var(--fg2); margin-top: 8px;">适用：Anycast 思路 → 本地优先读取，减少跨网络往返。</p>
+    </div>
+    <div class="card">
+      <h3>etcd / bbolt</h3>
+      <p style="color: var(--fg2); font-size: 0.9rem;">服务发现 KV 存储。只读事务直接返回 mmap 文件指针，避免分配开销。</p>
+      <div class="metric-row">
+        <span class="metric-label">bbolt 串行读</span>
+        <span class="metric-value good">~21ns</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">watch cache 命中率</span>
+        <span class="metric-value good">~92%</span>
+      </div>
+      <p style="font-size: 0.8rem; color: var(--fg2); margin-top: 8px;">适用：mmap 零拷贝读路径 → SQLite 读路径优化方向。</p>
+    </div>
+    <div class="card">
+      <h3>NodeLocal DNS Cache</h3>
+      <p style="color: var(--fg2); font-size: 0.9rem;">K8s 本地 DNS 缓存，减少跨节点查询。</p>
+      <div class="metric-row">
+        <span class="metric-label">CoreDNS 网络路径</span>
+        <span class="metric-value warn">~5.2ms</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">NodeLocal 本地</span>
+        <span class="metric-value good">~0.2ms</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">提升</span>
+        <span class="metric-value good">29x</span>
+      </div>
+      <p style="font-size: 0.8rem; color: var(--fg2); margin-top: 8px;">适用：本地缓存层消除网络往返 = CachedStore 的核心价值。</p>
+    </div>
+    <div class="card">
+      <h3>SQLite mmap + WAL</h3>
+      <p style="color: var(--fg2); font-size: 0.9rem;">读密集场景用 mmap，读写混合用 WAL。</p>
+      <div class="metric-row">
+        <span class="metric-label">mmap vs 文件读</span>
+        <span class="metric-value good">10x+ 更快</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">WAL 读不阻塞写</span>
+        <span class="metric-value good">是</span>
+      </div>
+      <p style="font-size: 0.8rem; color: var(--fg2); margin-top: 8px;">适用：SQLite 底层存储 → 开启 mmap 提升穿透路径。</p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <p>IPv8 Resolver 超低延迟深度分析 — 2026-09-10 | 基于业界 2024-2026 生产系统最佳实践</p>
+</footer>
+
+</div>
+</body>
+</html>

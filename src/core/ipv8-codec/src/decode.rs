@@ -176,13 +176,14 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>, DecodeError> {
 }
 
 fn read_addr(b: &[u8]) -> IPv8Address {
-    // Reserved 24 位：接收方忽略（不校验非零），内存中统一置 0
     IPv8Address {
-        asn: u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
-        host_id: u32::from_be_bytes([b[4], b[5], b[6], b[7]]),
-        device_id: u16::from_be_bytes([b[8], b[9]]),
-        cap_tag: u16::from_be_bytes([b[10], b[11]]),
-        sec_level: b[12],
-        reserved: [0; 3],
+        protocol: u16::from_be_bytes([b[0], b[1]]),
+        region_hi: u16::from_be_bytes([b[2], b[3]]),
+        region_mid: u16::from_be_bytes([b[4], b[5]]),
+        region_lo: u16::from_be_bytes([b[6], b[7]]),
+        subnet1: u16::from_be_bytes([b[8], b[9]]),
+        subnet2: u16::from_be_bytes([b[10], b[11]]),
+        node_hash: u16::from_be_bytes([b[12], b[13]]),
+        session_id: u16::from_be_bytes([b[14], b[15]]),
     }
 }

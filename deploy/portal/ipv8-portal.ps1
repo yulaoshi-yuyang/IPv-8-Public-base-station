@@ -1,38 +1,130 @@
-﻿param(
+﻿# ============================================================
+# IPv8+ Portal — 门户网站服务
+# HTTP + DNS + DHCP 三合一，前端资源来自 ui\ 目录（模板化渲染）
+#
+# 直接运行：  .\ipv8-portal.ps1
+# 后台运行：  .\start-website.ps1   结束：.\stop-website.ps1
+# ============================================================
+
+param(
     [int]$HttpPort = 9001,
     [string]$DownloadDir = "",
     [int]$DnsPort = 5353
 )
 
+$ErrorActionPreference = "Continue"
+
 if (-not $DownloadDir) {
-    $scriptDir = $PSScriptRoot
-    $projectRoot = Split-Path $scriptDir -Parent
-    $projectRoot = Split-Path $projectRoot -Parent
+    $projectRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
     $DownloadDir = Join-Path $projectRoot "deploy\cross-verify"
+} else {
+    $projectRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 }
 
-$ipv8Self = "fb14:0000:0000:0001:0001:0000:0001:0000"
+# 兜底地址：本机签证不可读时才使用（正常情况下应从签证文件派生真实地址）
+$ipv8SelfFallback = "fb14:0000:0000:0001:0001:0000:0100:0000"
+$ipv8Self  = $ipv8SelfFallback
+$domain    = "ipv8.yulaoshi.xyz"
+$uiDir     = Join-Path $PSScriptRoot "ui"
 $geoipFile = Join-Path $PSScriptRoot "ipv8-geoip.json"
-$dhcpFile = Join-Path $PSScriptRoot "ipv8-dhcp.ps1"
+$dhcpFile  = Join-Path $PSScriptRoot "ipv8-dhcp.ps1"
 
 # Dot-source DHCP module
 . $dhcpFile
 
+# ---------- 本机签证信息（真实 IPv8 地址的唯一来源） ----------
+# visa.bin 布局: MAGIC "IP8V"(4) + version(1) + machine_id(32) + ipv8_addr(16, 偏移37) + ...
+function Get-LocalVisaInfo {
+    $info = @{ exists = $false; addr = $null; caExists = $false }
+    $visaPath = Join-Path $env:USERPROFILE ".ipv8\visa.bin"
+    $caPath   = Join-Path $env:USERPROFILE ".ipv8\ca.pub"
+    $info.caExists = Test-Path $caPath
+    if (Test-Path $visaPath) {
+        try {
+            $bytes = [System.IO.File]::ReadAllBytes($visaPath)
+            if ($bytes.Length -ge 53 -and
+                $bytes[0] -eq 0x49 -and $bytes[1] -eq 0x50 -and
+                $bytes[2] -eq 0x38 -and $bytes[3] -eq 0x56 -and
+                $bytes[4] -eq 1) {
+                $groups = @()
+                for ($i = 37; $i -lt 53; $i += 2) {
+                    # 必须先转 [int]：PowerShell 的 -shl 会保持左操作数类型，
+                    # [byte] -shl 8 会被截回字节导致高 8 位丢失（fb14 错成 0014）
+                    $groups += ('{0:x4}' -f (([int]$bytes[$i] -shl 8) -bor [int]$bytes[$i + 1]))
+                }
+                $info.exists = $true
+                $info.addr = ($groups -join ':')
+            }
+        } catch {
+            Write-Host "  read visa failed: $_" -ForegroundColor Yellow
+        }
+    }
+    return $info
+}
+
+$localVisa0 = Get-LocalVisaInfo
+if ($localVisa0.exists -and $localVisa0.addr) { $ipv8Self = $localVisa0.addr }
+
+# ---------- 版本号单一来源（模板与 /api/ping8-version 共用） ----------
+function Get-Ping8Version {
+    $version = 3
+    $verFile = Join-Path $DownloadDir "ping8-version.txt"
+    if (Test-Path $verFile) {
+        $v = (Get-Content $verFile -Raw -ErrorAction SilentlyContinue)
+        if ($v) { $v = $v.Trim() }
+        if ($v -match '^\d+$') { $version = [int]$v }
+    } else {
+        $exePath = Join-Path $DownloadDir "ping8.exe"
+        if (-not (Test-Path $exePath)) { $exePath = Join-Path $projectRoot "ping8.exe" }
+        if (Test-Path $exePath) {
+            $ver = (Get-Item $exePath).VersionInfo
+            if ($ver.ProductVersion -match '^\d+$') { $version = [int]$ver.ProductVersion }
+        }
+    }
+    return $version
+}
+$ping8Version = Get-Ping8Version
+
 Write-Host "=== IPv8+ Portal Starting ===" -ForegroundColor Cyan
 
-# Load GeoIP database
+# ---------- 前端资源检查 ----------
+$templateFile = Join-Path $uiDir "portal.html"
+$cssFile      = Join-Path $uiDir "theme.css"
+$jsFiles      = @(
+    Join-Path $uiDir "portal.js"
+    Join-Path $uiDir "docs-data.js"
+    Join-Path $uiDir "topology.js"
+    Join-Path $uiDir "wizard.js"
+)
+
+foreach ($f in @($templateFile, $cssFile) + $jsFiles) {
+    if (-not (Test-Path $f)) {
+        Write-Host "FATAL: missing UI asset: $f" -ForegroundColor Red
+        exit 1
+    }
+}
+Write-Host "UI assets loaded from $uiDir" -ForegroundColor Green
+
+# ---------- GeoIP ----------
 $geoip = $null
+$geoipCount = 0
 if (Test-Path $geoipFile) {
     $geoip = Get-Content $geoipFile -Raw -Encoding UTF8 | ConvertFrom-Json
-    Write-Host "GeoIP database loaded: $($geoip.records.Count) records" -ForegroundColor Green
+    $geoipCount = @($geoip.records).Count
+    Write-Host "GeoIP database loaded: $geoipCount records" -ForegroundColor Green
 } else {
     Write-Host "WARNING: GeoIP database not found at $geoipFile" -ForegroundColor Yellow
 }
 
-# Kill old portal processes
-Get-Process powershell -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID -and $_.StartTime -gt (Get-Date).AddHours(-1) } | ForEach-Object {
-    try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {}
-}
+# ---------- 清理旧门户实例 ----------
+# 仅结束此前运行的 ipv8-portal.ps1，不影响其他 PowerShell 窗口
+try {
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction Stop |
+        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine -match 'ipv8-portal\.ps1' } |
+        ForEach-Object {
+            try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+        }
+} catch {}
 Start-Sleep -Milliseconds 500
 
 # ============ DNS Server ============
@@ -66,7 +158,8 @@ try {
                     }
                     $off += 4
                     $qt = [BitConverter]::ToUInt16([byte[]]@($data[$off-3], $data[$off-4]), 0)
-                    if ($qname.EndsWith(".ipv8.net.")) {
+                    # DNS 域名大小写不敏感（EndsWith 默认区分大小写会导致部分查询无响应）
+                    if ($qname.EndsWith(".ipv8.net.", [StringComparison]::OrdinalIgnoreCase)) {
                         $resp = New-Object System.Collections.Generic.List[byte]
                         $resp.Add($data[0]); $resp.Add($data[1])
                         $resp.Add(0x85); $resp.Add(0x80)
@@ -76,7 +169,7 @@ try {
                             $resp.AddRange([byte[]]@(0xC0,0x0C))
                             $resp.AddRange([byte[]]@(0,28,0,1,0,0,0,60))
                             $resp.AddRange([byte[]](0,16))
-                            $resp.AddRange([byte[]]@(0xfb,0x14,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x01,0x00,0x00,0x00,0x01,0x00,0x00))
+                            $resp.AddRange([byte[]](0xfb,0x14,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x01,0x00,0x00,0x00,0x01,0x00,0x00))
                         } else {
                             $resp[8] = 0; $resp[9] = 0
                         }
@@ -94,24 +187,35 @@ try {
 }
 
 # ============ HTTP Server ============
+function Start-HttpListener {
+    param([int]$Port)
+    $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+    $l.Start()
+    return $l
+}
+
 try {
-    $listener = New-Object System.Net.HttpListener
-    $listener.Prefixes.Add("http://127.0.0.1:$HttpPort/")
-    $listener.Start()
+    $listener = Start-HttpListener $HttpPort
     Write-Host "HTTP on http://127.0.0.1:$HttpPort" -ForegroundColor Green
 } catch {
-    Get-NetTCPConnection -LocalPort $HttpPort -ErrorAction SilentlyContinue | ForEach-Object {
-        Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
-    }
+    # 端口被占用：只结束占用该端口的用户进程，避开 System(4) 等内核进程
+    Get-NetTCPConnection -LocalPort $HttpPort -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique |
+        Where-Object { $_ -gt 4 } |
+        ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
     Start-Sleep 1
-    $listener = New-Object System.Net.HttpListener
-    $listener.Prefixes.Add("http://127.0.0.1:$HttpPort/")
-    $listener.Start()
-    Write-Host "HTTP on http://127.0.0.1:$HttpPort (retry OK)" -ForegroundColor Green
+    try {
+        $listener = Start-HttpListener $HttpPort
+        Write-Host "HTTP on http://127.0.0.1:$HttpPort (retry OK)" -ForegroundColor Green
+    } catch {
+        Write-Host "FATAL: cannot bind port $HttpPort : $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
 }
 
 Write-Host "Download dir: $DownloadDir`n" -ForegroundColor Gray
 
+# ============ 工具函数 ============
 function Get-ServerIPv6 {
     try {
         $addrs = Get-NetIPAddress -AddressFamily IPv6 -ErrorAction Stop |
@@ -196,295 +300,321 @@ function Lookup-GeoIP {
 }
 
 function Get-NodeStats {
+    # Cleanup stale clients first (no heartbeat for 2 minutes)
+    Cleanup-StaleClients -timeoutSeconds 120
+
     $stats = @{ uptime = 0; sealed = 0; delivered = 0; dropped = 0; clients = 0 }
     try {
-        $node = Get-Process ipv8-node -ErrorAction SilentlyContinue
+        $node = Get-Process ipv8-node -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($node) {
             $stats.uptime = [math]::Round(((Get-Date) - $node.StartTime).TotalSeconds)
         }
     } catch {}
-    $allocs = Get-AllAllocations
+    $allocs = @(Get-AllAllocations)
     $stats.clients = @($allocs | Where-Object { $_.status -eq "active" }).Count
     return $stats
 }
 
+# HTML 转义，防止客户端名等外部数据破坏页面结构
+function ConvertTo-HtmlText {
+    param([string]$s)
+    if ($null -eq $s) { return "" }
+    return $s.Replace("&","&amp;").Replace("<","&lt;").Replace(">","&gt;").Replace('"',"&quot;").Replace("'","&#39;")
+}
+
+# ---------- Landing page (template render) ----------
 function Build-LandingPage {
-    $ipv6 = Get-ServerIPv6
-    if (-not $ipv6) { $ipv6 = "(detecting...)" }
+    $html = [System.IO.File]::ReadAllText($templateFile, [System.Text.Encoding]::UTF8)
 
-    $files = @()
-    if (Test-Path $DownloadDir) {
-        Get-ChildItem $DownloadDir -File | Where-Object { $_.Extension -in '.exe','.dll','.ps1','.md','.zip' } | ForEach-Object {
-            $sizeKB = [math]::Round($_.Length / 1KB, 1)
-            if ($sizeKB -gt 1024) { $sizeStr = "$([math]::Round($sizeKB/1024,1)) MB" } else { $sizeStr = "$sizeKB KB" }
-            $files += "<tr><td><a href=""/download/$($_.Name)"">$($_.Name)</a></td><td>$sizeStr</td><td>$($_.Extension)</td></tr>"
-        }
+    # Only placeholders that actually exist in the template; live data comes from AJAX
+    $map = @{
+        "{{DOMAIN}}"    = $domain
+        "{{IPV8_SELF}}" = $ipv8Self
+        "{{VERSION}}"   = "$ping8Version"
+        "{{YEAR}}"      = (Get-Date).Year.ToString()
     }
-    if ($files.Count -eq 0) { $files = @("<tr><td colspan=3>暂无文件</td></tr>") }
-    $filesHtml = $files -join "`n"
-
-    $stats = Get-NodeStats
-    $allocs = Get-AllAllocations
-    $clientsHtml = ""
-    if ($allocs -and $allocs.Count -gt 0) {
-        $clientsHtml = "<table><tr><th>IPv8 地址</th><th>TUN IP</th><th>Client</th><th>分配时间</th><th>状态</th></tr>"
-        foreach ($a in $allocs) {
-            $clientsHtml += "<tr><td class='mono'>$($a.ipv8_compact)</td><td class='mono'>$($a.tun_ip)</td><td>$($a.client_name)</td><td>$($a.assigned_at)</td><td><span class='badge'>$($a.status)</span></td></tr>"
-        }
-        $clientsHtml += "</table>"
-    } else {
-        $clientsHtml = "<p style='color:#666;text-align:center;padding:20px'>暂无客户端连接</p>"
+    foreach ($k in $map.Keys) {
+        $html = $html.Replace($k, $map[$k])
     }
-
-    $html = @"
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>IPv8+ Portal</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:#0a0e27;color:#e0e0e0;min-height:100vh}
-.container{max-width:960px;margin:0 auto;padding:40px 20px}
-.header{text-align:center;margin-bottom:40px}
-.header h1{font-size:2.8em;background:linear-gradient(135deg,#00d4ff,#7b2ff7);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.header p{color:#888;margin-top:8px;font-size:1.1em}
-.card{background:#141831;border:1px solid #1e2444;border-radius:12px;padding:24px;margin-bottom:20px}
-.card h2{color:#00d4ff;margin-bottom:12px;font-size:1.3em}
-.info-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.info-item{background:#0a0e27;padding:12px 16px;border-radius:8px;border:1px solid #1e2444}
-.info-item .label{color:#666;font-size:0.85em;margin-bottom:4px}
-.info-item .value{color:#00d4ff;font-family:monospace;font-size:1.05em;word-break:break-all}
-table{width:100%;border-collapse:collapse}
-th{text-align:left;color:#666;padding:8px 12px;border-bottom:1px solid #1e2444;font-size:0.85em}
-td{padding:10px 12px;border-bottom:1px solid #0d1224}
-td a{color:#00d4ff;text-decoration:none}
-td a:hover{text-decoration:underline}
-.badge{display:inline-block;background:#1a3a2a;color:#4caf50;padding:2px 10px;border-radius:4px;font-size:0.8em}
-.footer{text-align:center;color:#444;margin-top:30px;font-size:0.85em}
-.btn{display:inline-block;background:linear-gradient(135deg,#00d4ff,#7b2ff7);color:#fff;padding:12px 32px;border-radius:8px;text-decoration:none;font-weight:bold;font-size:1.1em;border:none;cursor:pointer}
-.btn:hover{opacity:0.9}
-.btn-sm{padding:8px 20px;font-size:0.9em}
-.center{text-align:center}
-.code{background:#0a0e27;padding:12px;border-radius:6px;font-family:monospace;color:#4caf50;border:1px solid #1e2444;word-break:break-all}
-.mono{font-family:monospace;color:#00d4ff}
-.search-box{display:flex;gap:8px;margin-bottom:16px}
-.search-box input{flex:1;padding:12px 16px;background:#0a0e27;border:1px solid #1e2444;border-radius:8px;color:#e0e0e0;font-family:monospace;font-size:1em}
-.search-box input:focus{outline:none;border-color:#00d4ff}
-.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
-.stat-box{text-align:center;background:#0a0e27;padding:16px;border-radius:8px;border:1px solid #1e2444}
-.stat-box .stat-value{font-size:2em;color:#00d4ff;font-weight:bold}
-.stat-box .stat-label{color:#666;font-size:0.85em;margin-top:4px}
-.tab-bar{display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid #1e2444}
-.tab{padding:10px 20px;color:#666;cursor:pointer;border-bottom:2px solid transparent;font-size:0.95em}
-.tab.active{color:#00d4ff;border-bottom-color:#00d4ff}
-.tab:hover{color:#aaa}
-</style>
-</head>
-<body>
-<div class="container">
-<div class="header">
-<h1>IPv8+ Portal</h1>
-<p>yulaoshi.xyz IPv8+ Service Node</p>
-<span class="badge">ONLINE</span>
-<span class="badge" style="background:#2a1a3a;color:#7b2ff7">DNS</span>
-<span class="badge" style="background:#1a2a3a;color:#4fa3ff">GEOIP</span>
-<span class="badge" style="background:#2a3a1a;color:#a3ff4f">DHCP</span>
-</div>
-
-<div class="card">
-<h2>仪表盘</h2>
-<div class="stats-row">
-<div class="stat-box"><div class="stat-value" id="statClients">$($stats.clients)</div><div class="stat-label">客户端数</div></div>
-<div class="stat-box"><div class="stat-value" id="statUptime">$($stats.uptime)s</div><div class="stat-label">运行时长</div></div>
-<div class="stat-box"><div class="stat-value" id="statSealed">$($stats.sealed)</div><div class="stat-label">加密包数</div></div>
-<div class="stat-box"><div class="stat-value" id="statDelivered">$($stats.delivered)</div><div class="stat-label">送达包数</div></div>
-</div>
-</div>
-
-<div class="tab-bar">
-<div class="tab active" onclick="showTab('geoip')">GeoIP 查询</div>
-<div class="tab" onclick="showTab('clients')">已连接客户端</div>
-<div class="tab" onclick="showTab('download')">Downloads</div>
-<div class="tab" onclick="showTab('cross')">Cross-Machine Test</div>
-</div>
-
-<div id="tab-geoip" class="card tab-content">
-<h2>IPv8 GeoIP 查询</h2>
-<p style="color:#aaa;margin-bottom:12px">输入任意 IPv8 地址查询归属地、运营商、ASN 等信息</p>
-<div class="search-box">
-<input type="text" id="geoInput" placeholder="Enter IPv8 地址, e.g. fb14::1" value="" placeholder="Enter IPv8 地址 to query...">
-<button class="btn btn-sm" onclick="lookupGeo()">查询</button>
-</div>
-<div id="geoResult"></div>
-</div>
-
-<div id="tab-clients" class="card tab-content" style="display:none">
-<h2>已连接客户端</h2>
-<p style="color:#aaa;margin-bottom:12px">由 DHCP 系统自动分配的 IPv8 地址</p>
-$clientsHtml
-</div>
-
-<div id="tab-download" class="card tab-content" style="display:none">
-<h2>客户端下载</h2>
-<table><tr><th>文件</th><th>大小</th><th>类型</th></tr>$filesHtml</table>
-<div class="center" style="margin-top:16px">
-<a href="/api/client-package" class="btn">下载自动连接客户端 (ZIP)</a>
-</div>
-</div>
-
-<div id="tab-cross" class="card tab-content" style="display:none">
-<h2>跨机真网测试</h2>
-<p style="color:#aaa;margin-bottom:12px">直接在网页上发起测试，本机作为 A 端（主动），对端作为 B 端（被动等待）</p>
-<div style="background:#0a0e27;padding:16px;border-radius:8px;border:1px solid #1e2444;margin-bottom:12px">
-<p style="color:#4caf50;margin-bottom:8px">输入<strong>对端机器</strong>的 IP 地址（不是本机 IP），点击开始测试：</p>
-<div class="search-box">
-<input type="text" id="crossPeerIp" placeholder="输入对端 IP，例如 2409:8938::1 或 192.168.1.12" value="" style="flex:1">
-<input type="number" id="crossPeerPort" placeholder="端口" value="45801" style="width:100px">
-<button class="btn btn-sm" onclick="startCrossTest()" id="crossStartBtn">开始测试</button>
-</div>
-<div id="crossMyIp" style="margin-top:8px;padding:8px;background:#0d1224;border-radius:6px;border:1px solid #1e2444"></div>
-<div id="crossStatus" style="margin-top:8px"></div>
-<div id="crossResult" style="margin-top:8px"></div>
-</div>
-<div style="background:#0a0e27;padding:12px;border-radius:8px;border:1px solid #1e2444;margin-top:12px">
-<p style="color:#888;font-size:0.85em">说明：本机作为 A 端主动发起连接，对端需要先运行 B 端（被动等待模式）。每台机器有自己的公网 IPv6，互不相同。端口默认 45801，两台机器可以共用一个端口。</p>
-</div>
-</div>
-
-<div class="card">
-<h2>服务器信息</h2>
-<div class="info-grid">
-<div class="info-item"><div class="label">域名</div><div class="value">ipv8.yulaoshi.xyz</div></div>
-<div class="info-item"><div class="label">IPv8 域名</div><div class="value">portal.ipv8.net</div></div>
-<div class="info-item"><div class="label">公网 IPv6</div><div class="value">$ipv6</div></div>
-<div class="info-item"><div class="label">IPv8 地址</div><div class="value">$ipv8Self</div></div>
-<div class="info-item"><div class="label">协议</div><div class="value">IPv8+ Phase 5</div></div>
-<div class="info-item"><div class="label">DNS / DHCP</div><div class="value">127.0.0.1:$DnsPort / Auto</div></div>
-</div>
-</div>
-
-<div class="card">
-<h2>防火墙管理</h2>
-<p style="color:#aaa;margin-bottom:12px">放行外部用户连接请求，让外部可以访问 IPv8+ 服务</p>
-<div style="display:flex;gap:8px;margin-bottom:12px">
-<button class="btn btn-sm" onclick="firewallAction('open')">放行端口</button>
-<button class="btn btn-sm" onclick="firewallAction('close')">关闭所有规则</button>
-<button class="btn btn-sm" onclick="firewallAction('status')">查看状态</button>
-</div>
-<div id="firewallResult" style="margin-top:8px"></div>
-</div>
-
-<div class="footer">IPv8+ 协议 | yulaoshi.xyz 2026</div>
-</div>
-
-<script>
-function showTab(name) {
-document.querySelectorAll('.tab-content').forEach(e => e.style.display='none');
-document.querySelectorAll('.tab').forEach(e => e.classList.remove('active'));
-document.getElementById('tab-'+name).style.display='';
-event.target.classList.add('active');
-}
-function lookupGeo() {
-var input=document.getElementById('geoInput').value.trim();
-var r=document.getElementById('geoResult');
-r.innerHTML='<div style="color:#666;padding:8px">Querying...</div>';
-fetch('/api/geoip?ip='+encodeURIComponent(input)).then(r=>r.json()).then(d=>{
-if(d.error){r.innerHTML='<div style="color:#f44;padding:8px">'+d.error+'</div>';return}
-var rows=[['IP 地址',d.ip],['版本','IPv8+'],['国家',d.country],['省份',d.province],['城市',d.city],['区县',d.district],['邮编',d.zipcode],['区号',d.areacode],['ISP',d.isp],['ASN',d.asn],['组织',d.organization],['纬度',d.latitude],['经度',d.longitude],['用途',d.purpose],['操作者',d.operator],['网络类型',d.network_type],['备注',d.notes]];
-var h='<table style="width:100%">';
-rows.forEach(function(row){var v=row[1]||'';var c=v&&v!=='-'?'':' empty';h+='<tr><td style="color:#666;width:120px;font-size:0.9em">'+row[0]+'</td><td style="color:'+(c?'#444':'#00d4ff')+';font-family:monospace">'+(v||'-')+'</td></tr>'});
-h+='</table>';r.innerHTML=h;
-}).catch(e=>{r.innerHTML='<div style="color:#f44;padding:8px">Error: '+e+'</div>'});
-}
-window.onload=function(){setInterval(updateStats,5000);loadMyIp();};
-function loadMyIp(){
-fetch('/api/my-ip').then(r=>r.json()).then(d=>{
-var box=document.getElementById('crossMyIp');
-var html='<div style="color:#666;font-size:0.85em;margin-bottom:4px">本机 IP（告诉对端用这个连你）：</div>';
-html+='<div style="display:flex;gap:12px;flex-wrap:wrap">';
-if(d.ipv6){html+='<span style="color:#00d4ff;font-family:monospace">IPv6: '+d.ipv6+'</span>';}
-if(d.ipv4){html+='<span style="color:#888;font-family:monospace">IPv4: '+d.ipv4+'</span>';}
-if(!d.ipv6&&!d.ipv4){html+='<span style="color:#f44">未检测到公网 IP</span>';}
-html+='</div>';
-box.innerHTML=html;
-}).catch(()=>{document.getElementById('crossMyIp').innerHTML='<span style="color:#666">获取 IP 失败</span>';});
-}
-function startCrossTest(){
-var ip=document.getElementById('crossPeerIp').value.trim();
-var port=document.getElementById('crossPeerPort').value.trim()||'45801';
-var btn=document.getElementById('crossStartBtn');
-var st=document.getElementById('crossStatus');
-var rs=document.getElementById('crossResult');
-btn.disabled=true;btn.textContent='测试中...';
-st.innerHTML='<div style="color:#00d4ff;padding:8px">正在启动测试... 对端 '+ip+':'+port+'</div>';
-rs.innerHTML='';
-fetch('/api/cross-test?ip='+encodeURIComponent(ip)+'&port='+port).then(r=>r.json()).then(d=>{
-if(d.status==='running'){
-st.innerHTML='<div style="color:#ff9800;padding:8px">测试运行中... 等待结果</div>';
-var t=setInterval(function(){
-fetch('/api/cross-test-status').then(r=>r.json()).then(s=>{
-if(s.status==='running'){
-st.innerHTML='<div style="color:#ff9800;padding:8px">测试运行中... '+s.elapsed+'s</div>';
-if(s.output){rs.innerHTML='<pre style="color:#4caf50;font-family:monospace;font-size:0.9em;white-space:pre-wrap">'+s.output+'</pre>';}
-}else if(s.status==='pass'){
-st.innerHTML='<div style="color:#4caf50;padding:8px;font-size:1.2em">✅ 测试通过 PASS</div>';
-if(s.output){rs.innerHTML='<pre style="color:#4caf50;font-family:monospace;font-size:0.9em;white-space:pre-wrap">'+s.output+'</pre>';}
-btn.disabled=false;btn.textContent='开始测试';
-clearInterval(t);
-}else if(s.status==='fail'){
-st.innerHTML='<div style="color:#f44;padding:8px;font-size:1.2em">❌ 测试失败 FAIL</div>';
-if(s.output){rs.innerHTML='<pre style="color:#f88;font-family:monospace;font-size:0.9em;white-space:pre-wrap">'+s.output+'</pre>';}
-btn.disabled=false;btn.textContent='开始测试';
-clearInterval(t);
-}else if(s.status==='idle'){
-st.innerHTML='<div style="color:#666;padding:8px">测试已结束</div>';
-btn.disabled=false;btn.textContent='开始测试';
-clearInterval(t);
-}
-}).catch(()=>{});
-},2000);
-}else if(d.error){
-st.innerHTML='<div style="color:#f44;padding:8px">错误: '+d.error+'</div>';
-btn.disabled=false;btn.textContent='开始测试';
-}
-}).catch(e=>{
-st.innerHTML='<div style="color:#f44;padding:8px">请求失败: '+e+'</div>';
-btn.disabled=false;btn.textContent='开始测试';
-});
-}
-function updateStats(){fetch('/api/stats').then(r=>r.json()).then(d=>{document.getElementById('statClients').textContent=d.clients;document.getElementById('statUptime').textContent=d.uptime+'s';document.getElementById('statSealed').textContent=d.sealed;document.getElementById('statDelivered').textContent=d.delivered;}).catch(()=>{});}
-function firewallAction(action){
-var box=document.getElementById('firewallResult');
-box.innerHTML='<div style="color:#666;padding:8px">正在执行...</div>';
-fetch('/api/firewall?action='+action).then(r=>r.json()).then(d=>{
-var h='<div style="color:#4caf50;padding:8px;margin-bottom:8px">'+(d.result||[]).join('<br>')+'</div>';
-if(d.rules&&d.rules.length>0){
-h+='<table><tr><th>规则名称</th><th>方向</th><th>状态</th></tr>';
-d.rules.forEach(function(r){h+='<tr><td style="color:#00d4ff;font-family:monospace">'+r.DisplayName+'</td><td>'+(r.Direction==1?'入站':'出站')+'</td><td>'+(r.Enabled?'<span style="color:#4caf50">启用</span>':'<span style="color:#f44">禁用</span>')+'</td></tr>';});
-h+='</table>';
-}
-box.innerHTML=h;
-}).catch(e=>{box.innerHTML='<div style="color:#f44;padding:8px">错误: '+e+'</div>';});
-}
-</script>
-</body>
-</html>
-"@
     return $html
 }
 
-# ============ Request Loop ============
-while ($listener.IsListening) {
-    try {
-        $context = $listener.GetContext()
-        $request = $context.Request
-        $response = $context.Response
-        $path = $request.Url.AbsolutePath
-        $method = $request.HttpMethod
+# ---------- 子域名节点页 ----------
+function Build-NodePage {
+    param([string]$subdomain, $matched)
 
-        if ($path -eq "/" -or $path -eq "") {
+    $tpl = @'
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="__THEME__">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>__SUB__ - IPv8+ Node</title>
+<link rel="stylesheet" href="/ui/theme.css">
+</head>
+<body>
+<div class="node-page">
+  <div class="node-card">
+    <h1>__SUB__</h1>
+    <div class="node-domain">__SUB__.ipv8.yulaoshi.xyz</div>
+    <div class="node-rows">
+      <div class="node-row"><span class="k">IPv8 地址</span><span class="v">__IPV8__</span></div>
+      <div class="node-row"><span class="k">TUN IP</span><span class="v">__TUN__</span></div>
+      <div class="node-row"><span class="k">分配时间</span><span class="v">__TIME__</span></div>
+      <div class="node-row"><span class="k">状态</span><span class="v"><span class="badge badge-ok">__STATUS__</span></span></div>
+    </div>
+    <p style="color:var(--text-muted);font-size:.88rem;margin-bottom:20px">此客户端已连接到 IPv8+ 网络</p>
+    <a href="https://ipv8.yulaoshi.xyz" class="btn">返回主门户</a>
+  </div>
+</div>
+<script>
+(function(){try{var t=localStorage.getItem('ipv8-theme');if(t){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();
+</script>
+</body>
+</html>
+'@
+    $tpl = $tpl.Replace("__THEME__", "night").Replace("__SUB__", (ConvertTo-HtmlText $subdomain))
+    $tpl = $tpl.Replace("__IPV8__", (ConvertTo-HtmlText $matched.ipv8_full))
+    $tpl = $tpl.Replace("__TUN__", (ConvertTo-HtmlText $matched.tun_ip))
+    $tpl = $tpl.Replace("__TIME__", (ConvertTo-HtmlText $matched.assigned_at))
+    $tpl = $tpl.Replace("__STATUS__", (ConvertTo-HtmlText $matched.status))
+    return $tpl
+}
+
+function Build-NodeNotFoundPage {
+    param([string]$subdomain)
+    $tpl = @'
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="night">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IPv8+ Node Not Found</title>
+<link rel="stylesheet" href="/ui/theme.css">
+</head>
+<body>
+<div class="node-page">
+  <div class="node-card">
+    <h1 style="color:var(--danger)">节点未找到</h1>
+    <div class="node-domain">__SUB__.ipv8.yulaoshi.xyz</div>
+    <p style="color:var(--text-muted);font-size:.92rem;line-height:1.75;margin-bottom:24px">
+      子域名 <strong style="color:var(--text)">__SUB__</strong> 没有对应的 IPv8+ 客户端。<br>
+      请确认该客户端已连接并成功注册地址。
+    </p>
+    <a href="https://ipv8.yulaoshi.xyz" class="btn">返回主门户</a>
+  </div>
+</div>
+<script>
+(function(){try{var t=localStorage.getItem('ipv8-theme');if(t){document.documentElement.setAttribute('data-theme',t);}}catch(e){}})();
+</script>
+</body>
+</html>
+'@
+    return $tpl.Replace("__SUB__", (ConvertTo-HtmlText $subdomain))
+}
+
+# ---------- 响应输出（TcpListener 版本） ----------
+# $response 是一个 hashtable，包含 stream（NetworkStream）和 extraHeaders（hashtable）
+function Send-Bytes {
+    param($response, [byte[]]$bytes, [string]$contentType, [int]$statusCode = 200)
+    try {
+        $statusText = switch ($statusCode) {
+            200 { "OK" }
+            206 { "Partial Content" }
+            400 { "Bad Request" }
+            404 { "Not Found" }
+            416 { "Range Not Satisfiable" }
+            500 { "Internal Server Error" }
+            default { "OK" }
+        }
+        $extra = $response.extraHeaders
+        $extraStr = ""
+        if ($extra) {
+            foreach ($k in $extra.Keys) {
+                $extraStr += "$k`: $($extra[$k])`r`n"
+            }
+        }
+        $header = "HTTP/1.1 $statusCode $statusText`r`nContent-Type: $contentType`r`nContent-Length: $($bytes.Length)`r`nCache-Control: no-cache`r`nConnection: close`r`n$extraStr`r`n"
+        $headerBytes = [System.Text.Encoding]::UTF8.GetBytes($header)
+        $response.stream.Write($headerBytes, 0, $headerBytes.Length)
+        $response.stream.Write($bytes, 0, $bytes.Length)
+    } catch {
+        Write-Host "  Send-Bytes error: $_" -ForegroundColor Red
+    }
+}
+
+function Send-Html {
+    param($response, [string]$html, [int]$statusCode = 200)
+    Send-Bytes $response ([System.Text.Encoding]::UTF8.GetBytes($html)) "text/html; charset=utf-8" $statusCode
+}
+
+function Send-Json {
+    param($response, $obj)
+    if ($obj -is [System.Array] -or ($obj -is [System.Collections.IEnumerable] -and $obj -isnot [string] -and $obj -isnot [hashtable])) {
+        $obj = @($obj)
+    }
+    $json = $obj | ConvertTo-Json -Depth 10 -Compress
+    if ([string]::IsNullOrEmpty($json)) {
+        $isList = ($obj -is [System.Array]) -or
+                  (($obj -is [System.Collections.IEnumerable]) -and ($obj -isnot [string]) -and ($obj -isnot [hashtable]))
+        $json = if ($isList) { "[]" } else { "null" }
+    }
+    Send-Bytes $response ([System.Text.Encoding]::UTF8.GetBytes($json)) "application/json; charset=utf-8"
+}
+
+function Get-RequestJson {
+    param($bodyStr)
+    try {
+        if ($bodyStr) { return ($bodyStr | ConvertFrom-Json) }
+    } catch {}
+    return $null
+}
+
+# ============ Request Loop (TcpListener 版本) ============
+while ($true) {
+    try {
+        $tcpClient = $listener.AcceptTcpClient()
+        $tcpClient.ReceiveTimeout = 10000
+        $tcpClient.SendTimeout = 30000
+        $stream = $tcpClient.GetStream()
+
+        # 构造 $response 对象（必须在读 body 之前，否则 413 等早期错误引用不到 $response）
+        $response = @{
+            stream = $stream
+            extraHeaders = @{}
+        }
+
+        # 读取 HTTP 请求
+        $ms = New-Object System.IO.MemoryStream
+        $buf = New-Object byte[] 8192
+        $headerEnd = -1
+        while ($stream.DataAvailable -or $tcpClient.Available -gt 0 -or $ms.Length -eq 0) {
+            $n = $stream.Read($buf, 0, $buf.Length)
+            if ($n -le 0) { break }
+            $ms.Write($buf, 0, $n)
+            $allBytes = $ms.ToArray()
+            $headerStr = [System.Text.Encoding]::ASCII.GetString($allBytes)
+            $headerEnd = $headerStr.IndexOf("`r`n`r`n")
+            if ($headerEnd -ge 0) { break }
+            if ($ms.Length -gt 1048576) { break }
+        }
+
+        if ($headerEnd -lt 0) {
+            $tcpClient.Close(); continue
+        }
+
+        $allBytes = $ms.ToArray()
+        $headerStr = [System.Text.Encoding]::ASCII.GetString($allBytes, 0, $headerEnd)
+        $headerLines = $headerStr -split "`r`n"
+
+        # 解析请求行（畸形请求直接断开）
+        $reqLine = $headerLines[0] -split " "
+        if ($reqLine.Count -lt 2 -or [string]::IsNullOrEmpty($reqLine[1])) {
+            try { $stream.Close(); $tcpClient.Close() } catch {}
+            continue
+        }
+        $method = $reqLine[0]
+        $reqPath = $reqLine[1]
+
+        # 解析 headers
+        $headers = @{}
+        for ($i = 1; $i -lt $headerLines.Count; $i++) {
+            $idx = $headerLines[$i].IndexOf(":")
+            if ($idx -gt 0) {
+                $hname = $headerLines[$i].Substring(0, $idx).Trim()
+                $hval = $headerLines[$i].Substring($idx + 1).Trim()
+                $headers[$hname] = $hval
+            }
+        }
+
+        # 解析 path 和 query
+        $path = $reqPath
+        $queryString = ""
+        $qIdx = $path.IndexOf("?")
+        if ($qIdx -ge 0) {
+            $queryString = $path.Substring($qIdx + 1)
+            $path = $path.Substring(0, $qIdx)
+        }
+
+        # 解析 query params
+        $queryParams = @{}
+        if ($queryString) {
+            foreach ($pair in ($queryString -split "&")) {
+                $kv = $pair -split "=", 2
+                if ($kv.Count -eq 2) {
+                    $queryParams[[uri]::UnescapeDataString($kv[0])] = [uri]::UnescapeDataString($kv[1])
+                }
+            }
+        }
+
+        # 读取请求体（上限 1MB，防超大 Content-Length 内存耗尽）
+        $bodyStr = ""
+        $contentLength = 0
+        # 只接受纯数字 Content-Length，畸形值按 0 处理（[int] 强转非数字会抛异常中断连接）
+        if ($headers.ContainsKey("Content-Length") -and "$($headers['Content-Length'])" -match '^\d{1,10}$') {
+            $contentLength = [int]$headers["Content-Length"]
+        }
+        if ($contentLength -gt 1048576) {
+            Send-Html $response "413: body too large" 400
+            try { $stream.Close(); $tcpClient.Close() } catch {}
+            continue
+        }
+        if ($contentLength -gt 0) {
+            $bodyStart = $headerEnd + 4
+            $bodyBytes = New-Object byte[] $contentLength
+            $alreadyRead = $allBytes.Length - $bodyStart
+            if ($alreadyRead -gt 0) {
+                [Array]::Copy($allBytes, $bodyStart, $bodyBytes, 0, [Math]::Min($alreadyRead, $contentLength))
+            }
+            while ($alreadyRead -lt $contentLength) {
+                $n = $stream.Read($bodyBytes, $alreadyRead, $contentLength - $alreadyRead)
+                if ($n -le 0) { break }
+                $alreadyRead += $n
+            }
+            $bodyStr = [System.Text.Encoding]::UTF8.GetString($bodyBytes)
+        }
+
+        # 构造一个模拟的 $request 对象，兼容旧代码
+        $remoteIp = ($tcpClient.Client.RemoteEndPoint -as [System.Net.IPEndPoint]).Address.ToString()
+        $request = @{
+            HttpMethod = $method
+            Url = @{ AbsolutePath = $path }
+            Headers = $headers
+            QueryString = $queryParams
+            InputStream = $null
+            ContentLength64 = $contentLength
+            HasEntityBody = ($contentLength -gt 0)
+            RemoteEndPoint = @{ Address = @{ ToString = $remoteIp } }
+            BodyString = $bodyStr
+            RemoteIP = $remoteIp
+        }
+
+        # ---------- 路由分发 ----------
+        # ---------- 静态前端资源 ----------
+        if ($path -match "^/ui/([A-Za-z0-9_\-\.]+)$") {
+            $asset = $Matches[1]
+            # 防目录穿越：仅允许 ui 目录下的白名单文件
+            $allowed = @{
+                "theme.css"   = "text/css; charset=utf-8"
+                "portal.js"   = "application/javascript; charset=utf-8"
+                "docs-data.js"= "application/javascript; charset=utf-8"
+                "topology.js" = "application/javascript; charset=utf-8"
+                "wizard.js"   = "application/javascript; charset=utf-8"
+            }
+            if ($allowed.ContainsKey($asset)) {
+                $assetPath = Join-Path $uiDir $asset
+                if (Test-Path $assetPath -PathType Leaf) {
+                    $bytes = [System.IO.File]::ReadAllBytes($assetPath)
+                    Send-Bytes $response $bytes $allowed[$asset]
+                } else {
+                    Send-Html $response "404: asset missing" 404
+                }
+            } else {
+                Send-Html $response "404: unknown asset" 404
+            }
+        }
+        # ---------- 首页 / 子域名节点页 ----------
+        elseif ($path -eq "/" -or $path -eq "") {
             $hostHeader = $request.Headers["Host"]
             $subdomain = $null
             if ($hostHeader -match "^([a-zA-Z0-9-]+)\.ipv8\.yulaoshi\.xyz") {
@@ -493,168 +623,190 @@ while ($listener.IsListening) {
                 $subdomain = $Matches[1]
             }
             if ($subdomain -and $subdomain -ne "www" -and $subdomain -ne "ipv8") {
-                $allocs = Get-AllAllocations
-                $matched = $allocs | Where-Object { $_.client_name -eq $subdomain }
+                $allocs = @(Get-AllAllocations)
+                $matched = $allocs | Where-Object { $_.client_name -eq $subdomain } | Select-Object -First 1
                 if ($matched) {
-                    $html = @"
-<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>$subdomain - IPv8+ Node</title>
-<style>body{font-family:system-ui;background:#0a0e27;color:#e0e0e0;text-align:center;padding:60px 20px}
-h1{color:#00d4ff;font-size:2.5em}.info{color:#888;margin:20px 0;line-height:1.8}
-.mono{font-family:monospace;color:#00d4ff}.badge{display:inline-block;background:#1a3a2a;color:#4caf50;padding:4px 16px;border-radius:4px;margin:4px}
-</style></head><body>
-<h1>$subdomain.ipv8.yulaoshi.xyz</h1>
-<div class="info">IPv8 地址: <span class="mono">$($matched.ipv8_full)</span><br>
-TUN IP: <span class="mono">$($matched.tun_ip)</span><br>
-分配时间: $($matched.assigned_at)<br>
-状态: <span class="badge">$($matched.status)</span></div>
-<p style="color:#666">此客户端已连接到 IPv8+ 网络</p>
-</body></html>
-"@
+                    Send-Html $response (Build-NodePage $subdomain $matched)
                 } else {
-                    $html = @"
-<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>IPv8+ Node Not Found</title>
-<style>body{font-family:system-ui;background:#0a0e27;color:#e0e0e0;text-align:center;padding:60px 20px}
-h1{color:#f44}.info{color:#888;margin:20px 0}</style></head><body>
-<h1>IPv8 节点未找到</h1><div class="info">子域名 <b>$subdomain</b> 没有对应的 IPv8+ 客户端<br>请确认客户端已连接并注册</div>
-<p><a href="https://ipv8.yulaoshi.xyz" style="color:#00d4ff">返回主门户</a></p>
-</body></html>
-"@
+                    Send-Html $response (Build-NodeNotFoundPage $subdomain) 404
                 }
-                $buffer = [System.Text.Encoding]::UTF8.GetBytes($html)
-                $response.ContentType = "text/html; charset=utf-8"
-                $response.ContentLength64 = $buffer.Length
-                $response.OutputStream.Write($buffer, 0, $buffer.Length)
             } else {
-                $html = Build-LandingPage
-                $buffer = [System.Text.Encoding]::UTF8.GetBytes($html)
-                $response.ContentType = "text/html; charset=utf-8"
-                $response.ContentLength64 = $buffer.Length
-                $response.OutputStream.Write($buffer, 0, $buffer.Length)
+                Send-Html $response (Build-LandingPage)
             }
         }
+        # ---------- 文件下载 ----------
         elseif ($path -match "^/download/(.+)$") {
-            $fileName = $Matches[1]
-            $filePath = Join-Path $DownloadDir $fileName
-            if (Test-Path $filePath -PathType Leaf) {
-                $fileBytes = [System.IO.File]::ReadAllBytes($filePath)
-                $fileLen = $fileBytes.Length
-                $response.AddHeader("Content-Disposition", "attachment; filename=$fileName")
-                $response.AddHeader("Accept-Ranges", "bytes")
-                $response.ContentType = "application/octet-stream"
-                $rangeHeader = $request.Headers["Range"]
-                if ($rangeHeader -and $rangeHeader -match "bytes=(\d+)-(\d*)") {
-                    $start = [int64]$Matches[1]
-                    $end = if ($Matches[2]) { [int64]$Matches[2] } else { $fileLen - 1 }
-                    if ($end -ge $fileLen) { $end = $fileLen - 1 }
-                    $chunkLen = $end - $start + 1
-                    $response.StatusCode = 206
-                    $response.AddHeader("Content-Range", "bytes $start-$end/$fileLen")
-                    $response.ContentLength64 = $chunkLen
-                    $response.OutputStream.Write($fileBytes, $start, $chunkLen)
-                    Write-Host "  Sent (206): $fileName [$start-$end] ($chunkLen bytes)" -ForegroundColor Cyan
-                } else {
-                    $response.ContentLength64 = $fileLen
-                    $response.OutputStream.Write($fileBytes, 0, $fileLen)
-                    Write-Host "  Sent (200): $fileName ($fileLen bytes)" -ForegroundColor Cyan
-                }
+            $fileName = [uri]::UnescapeDataString($Matches[1])
+            # 防目录穿越：拒绝任何路径分隔符与上跳
+            if ($fileName -match '[\\/]' -or $fileName -match '\.\.' -or $fileName -match '^\.') {
+                Send-Html $response "400: invalid file name" 400
             } else {
-                $response.StatusCode = 404
-                $buffer = [System.Text.Encoding]::UTF8.GetBytes("404: $fileName")
-                $response.OutputStream.Write($buffer, 0, $buffer.Length)
+                $filePath = Join-Path $DownloadDir $fileName
+                # 二次确认解析后的真实路径仍在下载目录内
+                $fullDownload = [System.IO.Path]::GetFullPath($DownloadDir)
+                $fullFile = [System.IO.Path]::GetFullPath($filePath)
+                if ((Test-Path $filePath -PathType Leaf) -and $fullFile.StartsWith($fullDownload, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $fileBytes = [System.IO.File]::ReadAllBytes($filePath)
+                    $fileLen = $fileBytes.Length
+                    $response.extraHeaders["Content-Disposition"] = "attachment; filename=$fileName"
+                    $response.extraHeaders["Accept-Ranges"] = "bytes"
+                    $rangeHeader = $request.Headers["Range"]
+                    if ($rangeHeader -and $rangeHeader -match "bytes=(\d+)-(\d*)") {
+                        $start = [int64]$Matches[1]
+                        $end = if ($Matches[2]) { [int64]$Matches[2] } else { $fileLen - 1 }
+                        if ($end -ge $fileLen) { $end = $fileLen - 1 }
+                        if ($start -le $end) {
+                            $chunkLen = $end - $start + 1
+                            $response.extraHeaders["Content-Range"] = "bytes $start-$end/$fileLen"
+                            $chunk = New-Object byte[] $chunkLen
+                            [Array]::Copy($fileBytes, $start, $chunk, 0, $chunkLen)
+                            Send-Bytes $response $chunk "application/octet-stream" 206
+                            Write-Host "  Sent (206): $fileName [$start-$end] ($chunkLen bytes)" -ForegroundColor Cyan
+                        } else {
+                            $response.extraHeaders["Content-Range"] = "bytes */$fileLen"
+                            Send-Bytes $response (New-Object byte[] 0) "application/octet-stream" 416
+                            Write-Host "  Range not satisfiable: $fileName [$start-$end] (len $fileLen)" -ForegroundColor Yellow
+                        }
+                    } else {
+                        Send-Bytes $response $fileBytes "application/octet-stream"
+                        Write-Host "  Sent (200): $fileName ($fileLen bytes)" -ForegroundColor Cyan
+                    }
+                } else {
+                    Send-Html $response "404: $([uri]::EscapeDataString($fileName))" 404
+                }
             }
         }
+        # ---------- API ----------
         elseif ($path -eq "/api/geoip") {
             $queryIp = $request.QueryString["ip"]
-            if (-not $queryIp) { $queryIp = $ipv8Self }
+            if (-not $queryIp) {
+                $gv = Get-LocalVisaInfo
+                $queryIp = if ($gv.exists -and $gv.addr) { $gv.addr } else { $ipv8Self }
+            }
             $record = Lookup-GeoIP $queryIp
             $result = if ($record) {
                 @{ip=$queryIp;version="IPv8+";country=$record.country;province=$record.province;city=$record.city;district=$record.district;zipcode=$record.zipcode;areacode=$record.areacode;isp=$record.isp;asn=$record.asn;organization=$record.organization;latitude=$record.latitude;longitude=$record.longitude;purpose=$record.purpose;operator=$record.operator;network_type=$record.network_type;notes=$record.notes}
             } else {
                 @{ip=$queryIp;version="IPv8+";error="Not in database";country="-";province="-";city="-";district="-";zipcode="-";areacode="-";isp="-";asn="-";organization="-";latitude="-";longitude="-";purpose="-";operator="-";network_type="-";notes="-"}
             }
-            $json = $result | ConvertTo-Json
-            $buffer = [System.Text.Encoding]::UTF8.GetBytes($json)
-            $response.ContentType = "application/json; charset=utf-8"
-            $response.ContentLength64 = $buffer.Length
-            $response.OutputStream.Write($buffer, 0, $buffer.Length)
+            Send-Json $response $result
             Write-Host "  GeoIP: $queryIp -> $($record.city)" -ForegroundColor Cyan
         }
         elseif ($path -eq "/api/stats") {
-            $stats = Get-NodeStats
-            $json = $stats | ConvertTo-Json
-            $buffer = [System.Text.Encoding]::UTF8.GetBytes($json)
-            $response.ContentType = "application/json; charset=utf-8"
-            $response.ContentLength64 = $buffer.Length
-            $response.OutputStream.Write($buffer, 0, $buffer.Length)
+            Send-Json $response (Get-NodeStats)
         }
         elseif ($path -eq "/api/clients") {
-            $allocs = Get-AllAllocations
-            $json = $allocs | ConvertTo-Json
-            $buffer = [System.Text.Encoding]::UTF8.GetBytes($json)
-            $response.ContentType = "application/json; charset=utf-8"
-            $response.ContentLength64 = $buffer.Length
-            $response.OutputStream.Write($buffer, 0, $buffer.Length)
+            $all = @(Get-AllAllocations)
+            $active = @($all | Where-Object { $_.status -eq "active" })
+            Send-Json $response @{total=$all.Count; active=$active.Count}
+        }
+        elseif ($path -eq "/api/register" -and $method -eq "POST") {
+            try {
+                $bodyStr = $request.BodyString
+                Write-Host "  [register] body: $bodyStr" -ForegroundColor DarkGray
+                $bodyObj = $bodyStr | ConvertFrom-Json
+
+                $clientIp = $request.RemoteIP
+                if ($bodyObj.client_ip) { $clientIp = $bodyObj.client_ip }
+
+                $ipv8Addr = if ($bodyObj.ipv8_addr) { $bodyObj.ipv8_addr } else { "" }
+                $hostname = if ($bodyObj.hostname) { $bodyObj.hostname } else { "" }
+                $fingerprint = if ($bodyObj.fingerprint) { $bodyObj.fingerprint } else { "" }
+                $visaExists = if ($bodyObj.visa_exists) { [bool]$bodyObj.visa_exists } else { $false }
+                $caExists = if ($bodyObj.ca_exists) { [bool]$bodyObj.ca_exists } else { $false }
+
+                $alloc = Register-Client -clientIp $clientIp -ipv8Addr $ipv8Addr -hostname $hostname -fingerprint $fingerprint -visaExists $visaExists -caExists $caExists
+
+                if ($null -eq $alloc) {
+                    Write-Host "  [register] ERROR: Register-Client returned null" -ForegroundColor Red
+                    Send-Json $response @{ok=$false;error="Register-Client returned null"}
+                } else {
+                    Write-Host "  [register] OK: $hostname ($clientIp) -> $($alloc.ipv8_address)" -ForegroundColor Green
+                    Send-Json $response @{ok=$true;ipv8_address=$alloc.ipv8_address;client_name=$alloc.client_name}
+                }
+            } catch {
+                Write-Host "  [register] EXCEPTION: $_" -ForegroundColor Red
+                Send-Json $response @{ok=$false;error=$_.Exception.Message}
+            }
+        }
+        elseif ($path -eq "/api/heartbeat") {
+            $clientIp = $request.QueryString["ip"]
+            if (-not $clientIp) { $clientIp = $request.RemoteIP }
+            $updated = Update-Heartbeat -clientIp $clientIp
+            Send-Json $response @{ok=$updated;ip=$clientIp}
+        }
+        elseif ($path -eq "/api/probe-clients") {
+            $allocs = @(Get-AllAllocations | Where-Object { $_.status -eq "active" })
+            $results = @()
+            foreach ($a in $allocs) {
+                $alive = Probe-ClientAlive -clientIp $a.client_ip -port 9100 -timeoutMs 2000
+                if ($alive) {
+                    $a.last_seen = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                    $a.status = "active"
+                    $results += @{ip=$a.client_ip;name=$a.client_name;alive=$true}
+                } else {
+                    $results += @{ip=$a.client_ip;name=$a.client_name;alive=$false}
+                }
+            }
+            Cleanup-StaleClients -timeoutSeconds 120
+            $activeCount = @(Get-AllAllocations | Where-Object { $_.status -eq "active" }).Count
+            Send-Json $response @{probed=$results.Count;results=$results;active=$activeCount}
+            Write-Host "  Probed $($results.Count) clients, $activeCount active" -ForegroundColor Cyan
         }
         elseif ($path -eq "/api/allocate" -and $method -eq "POST") {
-            $body = New-Object System.IO.StreamReader $request.InputStream
-            $bodyStr = $body.ReadToEnd()
-            $bodyObj = $bodyStr | ConvertFrom-Json
-            $clientIp = $bodyObj.client_ip
-            $clientName = $bodyObj.client_name
-            $alloc = Allocate-IPv8Address $clientIp $clientName
-            $json = $alloc | ConvertTo-Json
-            $buffer = [System.Text.Encoding]::UTF8.GetBytes($json)
-            $response.ContentType = "application/json; charset=utf-8"
-            $response.ContentLength64 = $buffer.Length
-            $response.OutputStream.Write($buffer, 0, $buffer.Length)
-            Write-Host "  Allocated: $($alloc.ipv8_compact) to $clientIp" -ForegroundColor Green
+            $bodyObj = Get-RequestJson $request.BodyString
+            if (-not $bodyObj -or -not $bodyObj.client_ip) {
+                Send-Json $response @{error="missing or invalid client_ip"}
+                continue
+            }
+            $alloc = Allocate-IPv8Address $bodyObj.client_ip $bodyObj.client_name
+            Send-Json $response $alloc
+            Write-Host "  Allocated: $($alloc.ipv8_address) to $($bodyObj.client_ip)" -ForegroundColor Green
+        }
+        elseif ($path -eq "/api/ping8-version") {
+            Send-Json $response @{ version = $ping8Version }
+            Write-Host "  Version check: v$ping8Version" -ForegroundColor Green
         }
         elseif ($path -eq "/api/client-package") {
+            # 只返回 ping8.exe 文件，不再创建分配记录
+            # 客户端注册由 ping8 auto → POST /api/register 处理
             $clientIp = $request.QueryString["ip"]
-            if (-not $clientIp) { $clientIp = $request.RemoteEndPoint.Address.ToString() }
-            $alloc = Allocate-IPv8Address $clientIp
-            $launcherScript = Build-ClientLauncher $alloc
+            if (-not $clientIp) { $clientIp = $request.RemoteIP }
 
-            $tempDir = Join-Path $env:TEMP "ipv8-client-package"
-            New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
-            $launcherPath = Join-Path $tempDir "start-ipv8-client.ps1"
-            [System.IO.File]::WriteAllText($launcherPath, $launcherScript, [System.Text.Encoding]::UTF8)
+            $srcExe = Join-Path $DownloadDir "ping8.exe"
+            if (-not (Test-Path $srcExe)) {
+                $srcExe = Join-Path $projectRoot "ping8.exe"
+            }
+            if (-not (Test-Path $srcExe)) {
+                Send-Json $response @{error="ping8.exe not found"}
+                continue
+            }
 
-            # Copy node exe and dll
-            $srcExe = Join-Path $DownloadDir "ipv8-node.exe"
-            $srcDll = Join-Path $DownloadDir "wintun.dll"
-            if (Test-Path $srcExe) { Copy-Item $srcExe $tempDir -Force }
-            if (Test-Path $srcDll) { Copy-Item $srcDll $tempDir -Force }
-
-            # Create ZIP
-            $zipPath = Join-Path $env:TEMP "ipv8-client-auto.zip"
-            if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-            Compress-Archive -Path "$tempDir\*" -DestinationPath $zipPath -Force
-
-            $zipBytes = [System.IO.File]::ReadAllBytes($zipPath)
-            $zipLen = $zipBytes.Length
-            $response.ContentType = "application/zip"
-            $response.AddHeader("Content-Disposition", "attachment; filename=ipv8-client-auto.zip")
-            $response.AddHeader("Accept-Ranges", "bytes")
+            $exeBytes = [System.IO.File]::ReadAllBytes($srcExe)
+            $exeLen = $exeBytes.Length
+            $response.extraHeaders["Content-Disposition"] = "attachment; filename=ping8.exe"
+            $response.extraHeaders["Accept-Ranges"] = "bytes"
             $rangeHeader = $request.Headers["Range"]
             if ($rangeHeader -and $rangeHeader -match "bytes=(\d+)-(\d*)") {
                 $start = [int64]$Matches[1]
-                $end = if ($Matches[2]) { [int64]$Matches[2] } else { $zipLen - 1 }
-                if ($end -ge $zipLen) { $end = $zipLen - 1 }
-                $chunkLen = $end - $start + 1
-                $response.StatusCode = 206
-                $response.AddHeader("Content-Range", "bytes $start-$end/$zipLen")
-                $response.ContentLength64 = $chunkLen
-                $response.OutputStream.Write($zipBytes, $start, $chunkLen)
-                Write-Host "  Client package sent (206) [$start-$end] ($chunkLen bytes)" -ForegroundColor Green
+                $end = if ($Matches[2]) { [int64]$Matches[2] } else { $exeLen - 1 }
+                if ($end -ge $exeLen) { $end = $exeLen - 1 }
+                if ($start -le $end -and $start -lt $exeLen) {
+                    $chunkLen = $end - $start + 1
+                    $response.extraHeaders["Content-Range"] = "bytes $start-$end/$exeLen"
+                    $chunk = New-Object byte[] $chunkLen
+                    [Array]::Copy($exeBytes, $start, $chunk, 0, $chunkLen)
+                    Send-Bytes $response $chunk "application/octet-stream" 206
+                    Write-Host "  Client exe sent (206) [$start-$end] ($chunkLen bytes) to $clientIp" -ForegroundColor Green
+                } else {
+                    $response.extraHeaders["Content-Range"] = "bytes */$exeLen"
+                    Send-Bytes $response (New-Object byte[] 0) "application/octet-stream" 416
+                    Write-Host "  Client exe range not satisfiable [$start-$end] (len $exeLen)" -ForegroundColor Yellow
+                }
             } else {
-                $response.ContentLength64 = $zipLen
-                $response.OutputStream.Write($zipBytes, 0, $zipLen)
-                Write-Host "  Client package sent ($zipLen bytes)" -ForegroundColor Green
+                Send-Bytes $response $exeBytes "application/octet-stream"
+                Write-Host "  Client exe sent ($exeLen bytes) to $clientIp" -ForegroundColor Green
             }
-
-            Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-            Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
         }
         elseif ($path -eq "/api/resolve") {
             $hostname = $request.QueryString["host"]
@@ -664,154 +816,189 @@ h1{color:#f44}.info{color:#888;margin:20px 0}</style></head><body>
                 $resolvedIp = Get-ServerIPv6
                 if (-not $resolvedIp) { $resolvedIp = Get-ServerIPv4 }
             }
-            $allocs = Get-AllAllocations
-            foreach ($a in $allocs) {
+            foreach ($a in @(Get-AllAllocations)) {
                 if ($a.client_name -and "$($a.client_name).ipv8.net" -eq $hostname) {
                     $resolvedIp = $a.client_ip
                     break
                 }
             }
             if (-not $resolvedIp) { $resolvedIp = "127.0.0.1" }
-            $json = @{host=$hostname;ip=$resolvedIp} | ConvertTo-Json
-            $buffer = [System.Text.Encoding]::UTF8.GetBytes($json)
-            $response.ContentType = "application/json; charset=utf-8"
-            $response.ContentLength64 = $buffer.Length
-            $response.OutputStream.Write($buffer, 0, $buffer.Length)
+            Send-Json $response @{host=$hostname;ip=$resolvedIp}
         }
-        elseif ($path -eq "/api/firewall") {
+        elseif ($path -eq "/api/firewall" -or $path -eq "/api/firewall/rules" -or $path -eq "/api/firewall/stats") {
+            # ===== 只读展示：服务器与防火墙状态 =====
+            # 门户不管理用户规则，只展示节点自身状态 + 已连接客户端签证信息
+
             $action = $request.QueryString["action"]
-            if (-not $action) { $action = "status" }
-            $rules = @()
-            $existingRules = Get-NetFirewallRule -DisplayName "IPv8+*" -ErrorAction SilentlyContinue
+
+            # open/close 仍然保留（节点自身端口管理）
             if ($action -eq "open") {
                 $ports = @(45801, 45800, 9001, 5353)
+                $result = @()
                 foreach ($port in $ports) {
-                    $ruleName = "IPv8+ Port $port UDP"
-                    if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)) {
-                        New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol UDP -LocalPort $port -Action Allow -Profile Any | Out-Null
-                    }
-                    $ruleName = "IPv8+ Port $port TCP"
-                    if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)) {
-                        New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort $port -Action Allow -Profile Any | Out-Null
+                    foreach ($proto in @("UDP","TCP")) {
+                        $ruleName = "IPv8+ Port $port $proto"
+                        if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)) {
+                            try {
+                                New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol $proto -LocalPort $port -Action Allow -Profile Any -ErrorAction Stop | Out-Null
+                                $result += "OK $ruleName"
+                            } catch {
+                                $result += "FAIL $ruleName : $($_.Exception.Message)"
+                            }
+                        }
                     }
                 }
-                $rules += "Firewall rules opened for ports: $($ports -join ', ')"
-            } elseif ($action -eq "close") {
-                Get-NetFirewallRule -DisplayName "IPv8+*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-                $rules += "All IPv8+ firewall rules removed"
+                Send-Json $response @{action="open";result=$result}
+                Write-Host "  Firewall: open standard ports" -ForegroundColor Green
             }
-            $current = Get-NetFirewallRule -DisplayName "IPv8+*" -ErrorAction SilentlyContinue
-            $rules += "Current rules: $($current.Count)"
-            $json = @{action=$action;result=$rules;rules=@($current | Select-Object DisplayName,Enabled,Direction)} | ConvertTo-Json -Depth 3
-            $buffer = [System.Text.Encoding]::UTF8.GetBytes($json)
-            $response.ContentType = "application/json; charset=utf-8"
-            $response.ContentLength64 = $buffer.Length
-            $response.OutputStream.Write($buffer, 0, $buffer.Length)
-            Write-Host "  Firewall: $action" -ForegroundColor Cyan
+            elseif ($action -eq "close") {
+                Get-NetFirewallRule -DisplayName "IPv8+*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+                Send-Json $response @{action="close";result="All IPv8+ port rules removed"}
+                Write-Host "  Firewall: all port rules removed" -ForegroundColor Yellow
+            }
+            else {
+                # 默认：只读展示
+                $rawRules = @(Get-NetFirewallRule -DisplayName "IPv8+*" -ErrorAction SilentlyContinue)
+                $winRules = @()
+                foreach ($r in $rawRules) {
+                    $winRules += @{
+                        DisplayName = $r.DisplayName
+                        Enabled = [bool]$r.Enabled
+                        Direction = [int]$r.Direction
+                        Profile = [string]$r.Profile
+                    }
+                }
+
+                # 收集已连接客户端的统计信息（不暴露详细信息）
+                # 注意：此处变量名不能叫 $allocations —— 会遮蔽 DHCP 模块的同名哈希表，
+                # 导致后续分配/注册/存档全部作用在数组上而静默损坏
+                Cleanup-StaleClients -timeoutSeconds 120
+                $allocList = @(Get-AllAllocations)
+                $activeCount = @($allocList | Where-Object { $_.status -eq "active" }).Count
+                $withVisa = @($allocList | Where-Object { $_.status -eq "active" -and $_.visa_exists }).Count
+
+                # 节点自身签证状态
+                $visaPath = Join-Path $env:USERPROFILE ".ipv8\visa.bin"
+                $lv = Get-LocalVisaInfo
+                $visaExists = $lv.exists
+                $visaAddr = $lv.addr
+                $caExists = $lv.caExists
+
+                # 防火墙概况
+                $winActive = 0
+                foreach ($r in $winRules) {
+                    if ($r.Enabled) { $winActive++ }
+                }
+
+                $nodeIpv6 = Get-ServerIPv6
+                if (-not $nodeIpv6) { $nodeIpv6 = "未检测到" }
+
+                Send-Json $response @{
+                    winRules = $winRules
+                    winTotal = $winRules.Count
+                    winActive = $winActive
+                    clientCount = $activeCount
+                    clientsWithVisa = $withVisa
+                    visa = @{
+                        exists = $visaExists
+                        addr = $visaAddr
+                        caExists = $caExists
+                        path = $visaPath
+                    }
+                    node = @{
+                        domain = $domain
+                        ipv8 = $ipv8Self
+                        ipv6 = $nodeIpv6
+                        dns = "127.0.0.1:$DnsPort"
+                        version = "IPv8+ v$ping8Version"
+                    }
+                }
+                Write-Host "  Server info displayed: $activeCount clients, $($winRules.Count) FW rules" -ForegroundColor Cyan
+            }
         }
         elseif ($path -eq "/api/status") {
             $ipv6 = Get-ServerIPv6
             $stats = Get-NodeStats
-            $json = @{domain="ipv8.yulaoshi.xyz";ipv8=$ipv8Self;ipv6=$ipv6;status="online";dns="127.0.0.1:$DnsPort";clients=$stats.clients} | ConvertTo-Json
-            $buffer = [System.Text.Encoding]::UTF8.GetBytes($json)
-            $response.ContentType = "application/json; charset=utf-8"
-            $response.ContentLength64 = $buffer.Length
-            $response.OutputStream.Write($buffer, 0, $buffer.Length)
+            $sv = Get-LocalVisaInfo
+            $selfAddr = if ($sv.exists -and $sv.addr) { $sv.addr } else { $ipv8Self }
+            Send-Json $response @{domain=$domain;ipv8=$selfAddr;ipv6=$ipv6;status="online";dns="127.0.0.1:$DnsPort";clients=$stats.clients;visa=@{exists=$sv.exists;addr=$sv.addr};ca_exists=$sv.caExists}
         }
         elseif ($path -eq "/api/my-ip") {
-            $ipv6 = Get-ServerIPv6
-            $ipv4 = Get-ServerIPv4
-            $json = @{ipv6=$ipv6;ipv4=$ipv4} | ConvertTo-Json
-            $buffer = [System.Text.Encoding]::UTF8.GetBytes($json)
-            $response.ContentType = "application/json; charset=utf-8"
-            $response.ContentLength64 = $buffer.Length
-            $response.OutputStream.Write($buffer, 0, $buffer.Length)
+            Send-Json $response @{ipv6=(Get-ServerIPv6);ipv4=(Get-ServerIPv4)}
         }
         elseif ($path -eq "/api/cross-test") {
             $peerIp = $request.QueryString["ip"]
             $peerPort = $request.QueryString["port"]
             if (-not $peerPort) { $peerPort = "45801" }
             if (-not $peerIp) {
-                $json = '{"error":"missing ip parameter"}'
-                $buffer = [System.Text.Encoding]::UTF8.GetBytes($json)
-                $response.ContentType = "application/json; charset=utf-8"
-                $response.ContentLength64 = $buffer.Length
-                $response.OutputStream.Write($buffer, 0, $buffer.Length)
-                $response.Close()
+                Send-Json $response @{error="missing ip parameter"}
                 continue
             }
-            $script:crossTestOutput = ""
-            $script:crossTestStatus = "running"
+
+            $ping8Exe = Join-Path $projectRoot "target\release\ping8.exe"
+            if (-not (Test-Path $ping8Exe)) { $ping8Exe = Join-Path $DownloadDir "ping8.exe" }
+            if (-not (Test-Path $ping8Exe)) {
+                Send-Json $response @{error="ping8.exe not found"}
+                continue
+            }
+
             $script:crossTestStart = Get-Date
-            $nodeExe = Join-Path $projectRoot "target\release\ipv8-node.exe"
-            if (-not (Test-Path $nodeExe)) {
-                $nodeExe = Join-Path $DownloadDir "ipv8-node.exe"
-            }
-            if (-not (Test-Path $nodeExe)) {
-                $json = '{"error":"ipv8-node.exe not found"}'
-                $buffer = [System.Text.Encoding]::UTF8.GetBytes($json)
-                $response.ContentType = "application/json; charset=utf-8"
-                $response.ContentLength64 = $buffer.Length
-                $response.OutputStream.Write($buffer, 0, $buffer.Length)
-                $response.Close()
+
+            $argList = @("trust","request",$peerIp,$peerPort)
+
+            if ($script:crossTestJob -and $script:crossTestJob.State -eq "Running") {
+                Send-Json $response @{error="a trust request is already running"}
                 continue
             }
-            $selfAddr = "0000fb140000000a0001000001000000"
-            $peerAddr = "0000fb140000000b0001000001000000"
-            $udpPort = Get-Random -Minimum 46000 -Maximum 46999
-            $argList = @("--self",$selfAddr,"--peer-addr",$peerAddr,"--peer-ip",$peerIp,"--peer-port",$peerPort,"--udp-port",$udpPort,"--tun-ip","10.100.0.1","--tun-prefix","10","--adapter-name","IPv8Plus","--initiate","--no-tun","--nt-size","16")
+
+            # 输出重定向到临时文件（Start-Job 内 Start-Process 不带重定向时输出会丢失）
+            $outFile = Join-Path $env:TEMP "ipv8-cross-stdout.txt"
+            $errFile = Join-Path $env:TEMP "ipv8-cross-stderr.txt"
+            Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
+
             $script:crossTestJob = Start-Job -ScriptBlock {
-                param($exe,$a)
-                $p = Start-Process $exe -ArgumentList $a -NoNewWindow -Wait -PassThru -RedirectStandardOutput "$env:TEMP\ipv8-cross-stdout.txt" -RedirectStandardError "$env:TEMP\ipv8-cross-stderr.txt"
-                $out = Get-Content "$env:TEMP\ipv8-cross-stdout.txt" -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                $err = Get-Content "$env:TEMP\ipv8-cross-stderr.txt" -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                return @{stdout=$out;stderr=$err;exitcode=$p.ExitCode}
-            } -ArgumentList $nodeExe,$argList
-            $json = '{"status":"running"}'
-            $buffer = [System.Text.Encoding]::UTF8.GetBytes($json)
-            $response.ContentType = "application/json; charset=utf-8"
-            $response.ContentLength64 = $buffer.Length
-            $response.OutputStream.Write($buffer, 0, $buffer.Length)
-            Write-Host "  Cross-test started: $peerIp`:$peerPort" -ForegroundColor Cyan
+                param($exe,$a,$outF,$errF)
+                $p = Start-Process $exe -ArgumentList $a -NoNewWindow -Wait -PassThru `
+                     -RedirectStandardOutput $outF -RedirectStandardError $errF
+                return @{exitcode=$p.ExitCode}
+            } -ArgumentList $ping8Exe,$argList,$outFile,$errFile
+
+            Send-Json $response @{status="running";message="信任请求已发送，等待对端确认"}
+            Write-Host "  Trust request sent: $peerIp`:$peerPort" -ForegroundColor Cyan
         }
         elseif ($path -eq "/api/cross-test-status") {
             $status = "idle"
             $output = ""
             $elapsed = 0
+            $outFile = Join-Path $env:TEMP "ipv8-cross-stdout.txt"
+            $errFile = Join-Path $env:TEMP "ipv8-cross-stderr.txt"
             if ($script:crossTestJob) {
                 $elapsed = [math]::Round(((Get-Date) - $script:crossTestStart).TotalSeconds)
                 if ($script:crossTestJob.State -eq "Completed") {
                     $result = Receive-Job $script:crossTestJob
                     Remove-Job $script:crossTestJob -Force
                     $script:crossTestJob = $null
-                    $output = $result.stdout
-                    if ($result.stderr) { $output += "`n" + $result.stderr }
-                    if ($result.exitcode -eq 0 -and $output -match "PASS") {
-                        $status = "pass"
-                    } else {
-                        $status = "fail"
-                    }
+                    $output = Get-Content $outFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+                    $errOut = Get-Content $errFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+                    if ($errOut) { $output = "$output`n$errOut" }
+                    $exitCode = if ($result -and $result.exitcode -ne $null) { [int]$result.exitcode } else { -1 }
+                    # ping8 trust request：0 = 对端同意，非 0 = 超时/拒绝
+                    if ($exitCode -eq 0) { $status = "pass" } else { $status = "fail" }
                 } elseif ($script:crossTestJob.State -eq "Running") {
                     $status = "running"
-                    $tmpFile = "$env:TEMP\ipv8-cross-stdout.txt"
-                    if (Test-Path $tmpFile) {
-                        $output = Get-Content $tmpFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                    }
+                    if (Test-Path $outFile) { $output = Get-Content $outFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue }
                 }
             }
-            $json = @{status=$status;output=$output;elapsed=$elapsed} | ConvertTo-Json
-            $buffer = [System.Text.Encoding]::UTF8.GetBytes($json)
-            $response.ContentType = "application/json; charset=utf-8"
-            $response.ContentLength64 = $buffer.Length
-            $response.OutputStream.Write($buffer, 0, $buffer.Length)
+            Send-Json $response @{status=$status;output=$output;elapsed=$elapsed}
         }
         else {
-            $response.StatusCode = 404
-            $buffer = [System.Text.Encoding]::UTF8.GetBytes("404")
-            $response.OutputStream.Write($buffer, 0, $buffer.Length)
+            Send-Html $response "404" 404
         }
-        $response.Close()
+
+        # 关闭连接
+        try { $stream.Close(); $tcpClient.Close() } catch {}
     } catch {
         Write-Host "Error: $_" -ForegroundColor Red
+        try { $stream.Close(); $tcpClient.Close() } catch {}
     }
 }

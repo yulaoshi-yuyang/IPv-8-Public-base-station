@@ -1,4 +1,4 @@
-# deploy/client/setup-nrpt.ps1
+﻿# deploy/client/setup-nrpt.ps1
 # 一条命令把 .ipv8.net 的 DNS 查询引到本地代理（v9 §10）
 #Requires -RunAsAdministrator
 

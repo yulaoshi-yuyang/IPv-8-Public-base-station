@@ -470,6 +470,9 @@ impl Engine {
                 None
             }
             FrameType::Rekey => None, // 轮换seal 内部 epoch 推进覆盖，显Rekey 帧留接口
+            // FEC 恢复帧（Phase 4）：引擎不参与恢复——node 层在引擎之外喂
+            // FecRx；`--fec` 关闭时到这里的 Type=6 帧静默丢弃（零回归）
+            FrameType::FecRecovery => None,
         }
     }
 
@@ -777,7 +780,7 @@ mod tests {
     use crate::auth::{provision, CertAuthority, NO_EXPIRY};
 
     fn a(n: u32) -> IPv8Address {
-        IPv8Address::new(64500, n, 1, 0, 1)
+        IPv8Address::with_region(n as u64, 1, 0, 0x0100, 0)
     }
 
     /// 完整认证握手接入数据面：两个 Engine::authenticated handle_frame_at

@@ -1,0 +1,8 @@
+[package]
+name = "ipv8-neigh"
+description = "IPv8+ 二层邻居发现：IP8N HELLO/ACK 报文、Ed25519 验签注入、防重放与永久邻居表（纯函数，零依赖）"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]

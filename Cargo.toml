@@ -10,11 +10,19 @@ members = [
     "src/core/ipv8-tunnel",
     "src/core/ipv8-grpc",
     "src/core/ipv8-ffi",
+    "src/core/ipv8-firewall",
+    "src/core/ipv8-hook",
+    "src/core/ipv8-compat",
+    "src/core/ipv8-fec",
+    "src/core/ipv8-neigh",
     "src/cloud/zoneserver",
     "src/cloud/resolver",
     "src/cloud/ans",
     "src/adapter/wintun-node",
     "src/tools/ws-node",
+    "src/tools/ipv8-client",
+    "src/tools/ipv8-forward",
+    "src/tools/ipv8-netbench",
 ]
 
 [workspace.package]
@@ -24,8 +32,26 @@ license = "MIT"
 
 [workspace.dependencies]
 ipv8-codec = { path = "src/core/ipv8-codec" }
+ipv8-compat = { path = "src/core/ipv8-compat" }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 chacha20poly1305 = "0.10"
 sha2 = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# === 构建体积优化 ===
+# debug 模式：精简调试信息 + 打包 PDB，约省 30-40% 体积
+[profile.dev]
+debug = 1
+split-debuginfo = "packed"
+incremental = true
+
+# release 模式：LTO + strip，发布二进制最小化
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

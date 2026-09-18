@@ -38,6 +38,18 @@ Thumbs.db
 .DS_Store
 desktop.ini
 
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Backup files
+*.bak
+*.old
+
+# Screenshots
+screenshots/
+
 # Test results
 TestResults/
 *.trx
@@ -54,12 +66,28 @@ appsettings.Local.json
 # Large binaries / tool archives (downloaded, not built from source)
 *.exe
 *.zip
+!dist/driver/*.exe
 tools/cloudflared/cloudflared.exe
 scripts/ipv8-node.exe
 
 # One-off sharing artifacts
 .trae-html-share-packages/
 
+# IDE / local config
+.trae/
+.vs/
+.vscode/
+.idea/
+
+# Build output (regenerated from source)
+dist/
+artifacts/
+
 # Private deployment info (kept local only; see pre-push decision 2026-09-09)
 tools/cloudflared/cloudflared-ipv8-test.yml
 docs/references/
+
+# Signing certificates and tools (contain private keys)
+代码签名证书制作工具/
+
+.superpowers/

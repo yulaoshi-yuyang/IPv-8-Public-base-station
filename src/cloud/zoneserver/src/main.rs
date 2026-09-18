@@ -30,10 +30,13 @@ fn arg_value(argv: &[String], flag: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() {
+    // 结构化日志走 stderr，stdout 的 "listening on" 行保持给验证脚本匹配。
+    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))).with_writer(std::io::stderr).init();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let addr_str = arg_value(&argv, "--addr").unwrap_or_else(|| "127.0.0.1:7070".to_string());
     let Ok(addr) = SocketAddr::from_str(&addr_str) else {
-        eprintln!("[zoneserver] --addr 非法: {addr_str}");
+        tracing::error!(addr = %addr_str, "[zoneserver] --addr 非法");
         std::process::exit(2);
     };
     let ca_seed = match arg_value(&argv, "--ca-seed") {
@@ -65,7 +68,7 @@ async fn main() {
     let (local, handle) = match ipv8_zoneserver::grpc::serve(z, addr).await {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[zoneserver] 启动失败: {e}");
+            tracing::error!(error = %e, "[zoneserver] 启动失败");
             std::process::exit(1);
         }
     };

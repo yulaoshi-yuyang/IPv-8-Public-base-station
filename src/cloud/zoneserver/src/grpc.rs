@@ -159,7 +159,7 @@ mod tests {
     }
 
     fn addr_text(n: u32) -> String {
-        IPv8Address::new(64500, n, 1, 0, 1).to_canonical_string()
+        IPv8Address::with_region(n as u64, 1, 0, 0x0100, 0).to_canonical_string()
     }
 
     /// 客户端辅助：用签名私钥对注册请求签 PoP

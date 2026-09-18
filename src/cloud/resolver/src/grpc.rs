@@ -1,11 +1,13 @@
 //! Resolver gRPC 网络层（tonic；生成码来自 shared/ipv8-proto/resolver.proto）。
-//! 分层与 zoneserver 一致：本文件只做 协议 ↔ 领域 映射 + serve + e2e 测试，
-//! 决策逻辑全在 [`crate`]（零 IO，可脱离网络自测）。
+//!
+//! 泛型设计：`ResolverGrpc<S>` 可搭配任意 `Store` 实现（内存 / SQLite / ...）。
+//! 决策逻辑在 [`crate::ResolverService`]（零 IO），本文件只做协议映射与服务启动。
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tonic::{Request, Response, Status};
 
 pub mod pb {
@@ -18,25 +20,38 @@ use pb::{
     ResolveResponse,
 };
 
-use crate::{ResolveError, ResolverService};
+use crate::{ResolveError, ResolverService, Store};
 
+/// gRPC 服务包装（泛型于存储后端 S）
+///
+/// 锁策略（P3 优化）：
+/// - `RwLock` 替代 `Mutex`：resolve（读路径，占 90%+ 流量）并发执行，
+///   register/rendezvous（写路径）独占。
+/// - 读锁 ~25ns，写锁 ~65ns（parking_lot 自适应自旋、无 poisoning）。
+/// - SqliteStore 已将 `Connection` 包入 `Mutex` 使其 `Sync`，
+///   resolve 读路径只读 HashMap 缓存，不触碰 SQLite 连接。
 #[derive(Clone)]
-pub struct ResolverGrpc {
-    inner: Arc<Mutex<ResolverService>>,
+pub struct ResolverGrpc<S: Store> {
+    inner: Arc<RwLock<ResolverService<S>>>,
 }
 
-impl ResolverGrpc {
-    pub fn new(s: ResolverService) -> Self {
-        Self { inner: Arc::new(Mutex::new(s)) }
+impl<S: Store> ResolverGrpc<S> {
+    pub fn new(s: ResolverService<S>) -> Self {
+        Self { inner: Arc::new(RwLock::new(s)) }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, ResolverService> {
-        self.inner.lock().expect("resolver mutex poisoned")
+    #[inline]
+    fn read(&self) -> RwLockReadGuard<'_, ResolverService<S>> {
+        self.inner.read()
+    }
+
+    #[inline]
+    fn write(&self) -> RwLockWriteGuard<'_, ResolverService<S>> {
+        self.inner.write()
     }
 }
 
-/// ADR-026：从 tonic 连接扩展取服务端所见源地址（NAT 后的公网 "ip:port"）。
-/// 直连测试/uds/代理终结等拿不到时返回 None（observed 语义 = 尽力观察）。
+/// 从 tonic 连接扩展取服务端所见源地址（NAT 后的公网 "ip:port"）。
 fn observed_of<T>(req: &Request<T>) -> Option<String> {
     req.remote_addr().map(|a| a.to_string())
 }
@@ -45,25 +60,24 @@ fn resolve_err(e: ResolveError) -> Status {
     match e {
         ResolveError::BadAddress => Status::invalid_argument(e.to_string()),
         ResolveError::BadProof => Status::invalid_argument(e.to_string()),
-        // 未登记/过期：NotFound（语义准确，且不泄露曾存在性——ADR-007）
         ResolveError::NotFound => Status::not_found(e.to_string()),
         ResolveError::KeyConflict { .. } => Status::already_exists(e.to_string()),
     }
 }
 
 #[tonic::async_trait]
-impl ResolverSvc for ResolverGrpc {
+impl<S: Store + Send + Sync + 'static> ResolverSvc for ResolverGrpc<S> {
     async fn resolve(
         &self,
         req: Request<ResolveRequest>,
     ) -> Result<Response<ResolveResponse>, Status> {
         let r = req.into_inner();
-        let out = self.lock().resolve(&r.target_addr, Instant::now()).map_err(resolve_err)?;
+        let out = self.read().resolve(&r.target_addr, Instant::now()).map_err(resolve_err)?;
         Ok(Response::new(ResolveResponse {
             tunnel_entry_ip: out.tunnel_entry,
             ipv8_capable: out.ipv8_capable,
             mtu: out.mtu,
-            alt_ips: out.alt_entries,
+            alt_ips: out.alt_entries.to_vec(),
             ttl: u32::try_from(out.ttl.as_secs()).unwrap_or(u32::MAX),
         }))
     }
@@ -75,7 +89,7 @@ impl ResolverSvc for ResolverGrpc {
         let observed = observed_of(&req);
         let r = req.into_inner();
         let out = {
-            let mut g = self.lock();
+            let mut g = self.write();
             g.register(
                 &crate::RegisterSpec {
                     addr_text: &r.addr_text,
@@ -105,7 +119,7 @@ impl ResolverSvc for ResolverGrpc {
         let observed = observed_of(&req);
         let r = req.into_inner();
         let out = {
-            let mut g = self.lock();
+            let mut g = self.write();
             g.rendezvous(
                 &r.addr_text,
                 &r.peer_addr_text,
@@ -124,10 +138,11 @@ impl ResolverSvc for ResolverGrpc {
     }
 }
 
-/// 启动服务（ADR-011：端口 0 = 随机；返回实际绑定地址与后台句柄）。
-/// 服务任务内嵌 reaper：每分钟清理过期条目（自托管内存有界）。
-pub async fn serve(
-    s: ResolverService,
+/// 启动服务（泛型于存储后端 S）。
+/// 端口 0 = 随机绑定；返回实际绑定地址与后台任务句柄。
+/// 内嵌 reaper：每分钟清理过期条目。
+pub async fn serve<S: Store + Send + Sync + 'static>(
+    s: ResolverService<S>,
     addr: SocketAddr,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>>
 {
@@ -144,7 +159,7 @@ pub async fn serve(
                 async {
                     loop {
                         tick.tick().await;
-                        let _ = inner.lock().expect("resolver mutex poisoned").sweep_expired(Instant::now());
+                        let _ = inner.write().sweep_expired(Instant::now());
                     }
                 },
             );
@@ -159,16 +174,17 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use ipv8_codec::IPv8Address;
     use pb::resolver_client::ResolverClient;
+    use crate::MemStore;
 
     async fn spawn() -> ResolverClient<tonic::transport::Channel> {
-        let (local, _h) = serve(ResolverService::new(), "127.0.0.1:0".parse().unwrap())
+        let (local, _h) = serve(ResolverService::<MemStore>::new(), "127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
         ResolverClient::connect(format!("http://{local}")).await.unwrap()
     }
 
     fn addr_text(n: u32) -> String {
-        IPv8Address::new(64500, n, 1, 0, 1).to_canonical_string()
+        IPv8Address::with_region(n as u64, 1, 0, 0x0100, 0).to_canonical_string()
     }
 
     fn pop(sk: &SigningKey, t: &str) -> Vec<u8> {
@@ -177,7 +193,7 @@ mod tests {
             .to_vec()
     }
 
-    /// 登记 → 原子解析回环（v9 验收：一次 RPC 拿全字段）
+    /// 登记 → 原子解析回环
     #[tokio::test]
     async fn grpc_register_then_resolve_roundtrip() {
         let mut c = spawn().await;
@@ -199,7 +215,6 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(rr.ttl, 120);
-        // ADR-026：真实 TCP 连接上服务端必能观察到源地址（回环 = 127.0.0.1）
         assert!(rr.observed_addr.starts_with("127.0.0.1:"), "observed 回显: {}", rr.observed_addr);
 
         let resp = c
@@ -218,13 +233,11 @@ mod tests {
     #[tokio::test]
     async fn grpc_status_codes() {
         let mut c = spawn().await;
-        // 坏地址文本
         let e = c
             .resolve(ResolveRequest { target_addr: "zz".into(), client_ipv8_addr: String::new() })
             .await
             .unwrap_err();
         assert_eq!(e.code(), tonic::Code::InvalidArgument);
-        // 未登记 → NotFound（不泄露存在性）
         let e = c
             .resolve(ResolveRequest {
                 target_addr: addr_text(404),
@@ -233,7 +246,6 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e.code(), tonic::Code::NotFound);
-        // 坏 PoP
         let sk = SigningKey::from_bytes(&[0xA1u8; 32]);
         let t = addr_text(1);
         let e = c
@@ -253,12 +265,11 @@ mod tests {
         assert_eq!(e.code(), tonic::Code::InvalidArgument);
     }
 
-    /// ADR-026 级 2 端到端：两节点 register → 互相 rendezvous 拿到对端
-    /// 候选（observed 经真实 TCP 连接由服务端观察）→ 打洞地址就绪
+    /// ADR-026 端到端：两节点 register → 互相 rendezvous 拿到对端候选
     #[tokio::test]
     async fn grpc_rendezvous_swaps_observed_candidates() {
         use ed25519_dalek::Signer;
-        let (local, _h) = serve(ResolverService::new(), "127.0.0.1:0".parse().unwrap())
+        let (local, _h) = serve(ResolverService::<MemStore>::new(), "127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
         let mut ca = ResolverClient::connect(format!("http://{local}")).await.unwrap();
@@ -310,11 +321,8 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        // B 拿到的对端候选首选 = 组合（A 的 observed IP + A 登记端口 45700）；
-        // observed 原样（临时 TCP 端口）作兜底在列
         assert_eq!(rb.peer_candidates.first().map(String::as_str), Some("127.0.0.1:45700"));
         assert!(rb.peer_candidates.contains(&ra.self_observed), "observed 原样应保留兜底");
-        // A 再会合一轮（心跳刷新），这次能看到 B 的 observed —— 双向地址交换闭环
         let ra2 = ca
             .rendezvous(RendezvousRequest {
                 addr_text: ta,
@@ -333,11 +341,10 @@ mod tests {
         addr_text(1)
     }
 
-    /// 会合鉴权错误码：未登记 → NotFound；已登记但坏 PoP → InvalidArgument
+    /// 会合鉴权错误码
     #[tokio::test]
     async fn grpc_rendezvous_error_codes() {
         let mut c = spawn().await;
-        // 未登记地址发起会合 → NotFound（与 resolve 同防枚举语义）
         let e = c
             .rendezvous(RendezvousRequest {
                 addr_text: addr_text(1),
@@ -348,7 +355,6 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e.code(), tonic::Code::NotFound);
-        // 登记后，坏 PoP → InvalidArgument
         use ed25519_dalek::Signer;
         let sk = SigningKey::from_bytes(&[0xA1u8; 32]);
         let t = addr_text(1);

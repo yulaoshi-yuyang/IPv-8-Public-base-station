@@ -1,0 +1,8 @@
+[package]
+name = "ipv8-compat"
+description = "IPv8+ 隧道兼容性处理：TCP MSS 钳制、ICMP 差错、TTL、组播分类（纯函数，零依赖）"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]

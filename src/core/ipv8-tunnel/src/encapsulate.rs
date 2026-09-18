@@ -75,8 +75,8 @@ mod tests {
     }
 
     fn sample_packet() -> Vec<u8> {
-        let src = IPv8Address::new(10, 20, 1, 0x1234, 3);
-        let dst = IPv8Address::new(10, 21, 2, 0xFFFF, 1);
+        let src = IPv8Address::with_region(20, 1, 0x1234, 0x0300, 0);
+        let dst = IPv8Address::with_region(21, 2, 0xFFFF, 0x0100, 0);
         let inner = [0x45u8, 0x00, 0x00, 0x14]; // 假 IPv4 头前缀
         let hdr = IPv8Header::new(src, dst, inner.len() as u16);
         encode(&hdr, &inner).unwrap()
@@ -95,7 +95,7 @@ mod tests {
     fn ext_headers_stay_plaintext() {
         // spec §5.1：扩展头链在隧道帧中必须明文可见（外层/中间节点要能解析链）
         let (mut a, mut b) = keys_pair();
-        let src = IPv8Address::new(1, 2, 3, 4, 5);
+        let src = IPv8Address::with_region(2, 3, 4, 0x0500, 0);
         let mut hdr = IPv8Header::new(src, src, 4);
         hdr.attach_ext_headers(vec![ExtensionHeader::new(ExtType::SemanticTag, vec![0x5A; 16]).unwrap()]);
         let pkt = encode(&hdr, b"data").unwrap();
@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn ext_header_tamper_breaks_aead() {
         let (mut a, mut b) = keys_pair();
-        let src = IPv8Address::new(1, 2, 3, 4, 5);
+        let src = IPv8Address::with_region(2, 3, 4, 0x0500, 0);
         let mut hdr = IPv8Header::new(src, src, 4);
         hdr.attach_ext_headers(vec![ExtensionHeader::new(ExtType::IdentityToken, vec![0xAA; 8]).unwrap()]);
         let pkt = encode(&hdr, b"data").unwrap();
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn oversized_payload_encodes() {
         let (mut a, mut b) = keys_pair();
-        let src = IPv8Address::new(1, 1, 0, 0, 0);
+        let src = IPv8Address::with_region(1, 0, 0, 0, 0);
         let payload = vec![0u8; 60_000]; // 超 MTU，验证协议上限内的封装路径
         let hdr = IPv8Header::new(src, src, payload.len() as u16);
         let pkt = encode(&hdr, &payload).unwrap();

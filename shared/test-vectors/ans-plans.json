@@ -3,22 +3,22 @@
   "ca_seed": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
   "namespace_root": ".ipv8.net",
   "agents": [
-    { "short": "gamma", "name": "gamma.ipv8.net", "host": 1, "addr_text": "0000fbf4000000010001000001000000", "seed": 161, "caps": ["ocr"], "qos": 9, "not_after": 4000000000 },
-    { "short": "alpha", "name": "alpha.ipv8.net", "host": 2, "addr_text": "0000fbf4000000020001000001000000", "seed": 178, "caps": ["ocr", "layout"], "qos": 5, "not_after": 4000000000 },
-    { "short": "beta", "name": "beta.ipv8.net", "host": 3, "addr_text": "0000fbf4000000030001000001000000", "seed": 195, "caps": ["ocr", "translate"], "qos": 9, "not_after": 4000000000 }
+    { "short": "gamma", "name": "gamma.ipv8.net", "host": 1, "addr_text": "fb140000000000010001000001000000", "seed": 161, "caps": ["ocr"], "qos": 9, "not_after": 4000000000 },
+    { "short": "alpha", "name": "alpha.ipv8.net", "host": 2, "addr_text": "fb140000000000020001000001000000", "seed": 178, "caps": ["ocr", "layout"], "qos": 5, "not_after": 4000000000 },
+    { "short": "beta", "name": "beta.ipv8.net", "host": 3, "addr_text": "fb140000000000030001000001000000", "seed": 195, "caps": ["ocr", "translate"], "qos": 9, "not_after": 4000000000 }
   ],
   "steps": [
     { "do": "capability", "at": 2000000000, "required": ["ocr"], "min_qos": 0, "exclude_leased": true, "expect_names": ["gamma.ipv8.net", "beta.ipv8.net", "alpha.ipv8.net"], "note": "qos desc; gamma/beta tie at 9 -> addr asc" },
     { "do": "capability", "at": 2000000000, "required": ["ocr"], "min_qos": 9, "exclude_leased": true, "expect_names": ["gamma.ipv8.net", "beta.ipv8.net"] },
     { "do": "capability", "at": 2000000000, "required": ["ocr", "translate"], "min_qos": 0, "exclude_leased": true, "expect_names": ["beta.ipv8.net"], "note": "exact cover: only beta has translate" },
-    { "do": "plan", "at": 2000000000, "required": ["ocr"], "min_count": 2, "qos": 0, "timeout_ms": 60000, "expect_assign_addrs": ["0000fbf4000000010001000001000000", "0000fbf4000000030001000001000000"], "expect_lease_secs": 60 },
+    { "do": "plan", "at": 2000000000, "required": ["ocr"], "min_count": 2, "qos": 0, "timeout_ms": 60000, "expect_assign_addrs": ["fb140000000000010001000001000000", "fb140000000000030001000001000000"], "expect_lease_secs": 60 },
     { "do": "capability", "at": 2000000000, "required": ["ocr"], "min_qos": 0, "exclude_leased": true, "expect_names": ["alpha.ipv8.net"], "note": "gamma/beta leased by plan1" },
     { "do": "capability", "at": 2000000000, "required": ["ocr"], "min_qos": 0, "exclude_leased": false, "expect_names": ["gamma.ipv8.net", "beta.ipv8.net", "alpha.ipv8.net"], "note": "discovery mode keeps leased" },
-    { "do": "report", "plan_seq": 1, "addr_text": "0000fbf4000000010001000001000000", "at": 2000000001, "expect_released": true },
+    { "do": "report", "plan_seq": 1, "addr_text": "fb140000000000010001000001000000", "at": 2000000001, "expect_released": true },
     { "do": "capability", "at": 2000000001, "required": ["ocr"], "min_qos": 0, "exclude_leased": true, "expect_names": ["gamma.ipv8.net", "alpha.ipv8.net"], "note": "gamma back after report (qos 9 still first)" },
     { "do": "plan", "at": 2000000001, "required": ["ocr"], "min_count": 3, "qos": 0, "timeout_ms": 5000, "expect_error": "insufficient", "note": "only gamma+alpha free (beta leased), 3 not available -> error, no side effect" },
-    { "do": "plan", "at": 2000000001, "required": ["ocr"], "min_count": 2, "qos": 0, "timeout_ms": 999999999999, "expect_assign_addrs": ["0000fbf4000000010001000001000000", "0000fbf4000000020001000001000000"], "expect_lease_secs": 3600, "note": "timeout clamped to 1h" },
+    { "do": "plan", "at": 2000000001, "required": ["ocr"], "min_count": 2, "qos": 0, "timeout_ms": 999999999999, "expect_assign_addrs": ["fb140000000000010001000001000000", "fb140000000000020001000001000000"], "expect_lease_secs": 3600, "note": "timeout clamped to 1h" },
     { "do": "reap", "at": 2000000061, "probe_required": ["ocr"], "expect_available_after": ["beta.ipv8.net"], "note": "plan1 lease on beta (expiry at+60) expired and released; gamma/alpha still inside plan-3600s lease" },
-    { "do": "report", "plan_seq": 1, "addr_text": "0000fbf4000000030001000001000000", "at": 2000000061, "expect_released": false, "note": "beta lease already reclaimed -> report misses" }
+    { "do": "report", "plan_seq": 1, "addr_text": "fb140000000000030001000001000000", "at": 2000000061, "expect_released": false, "note": "beta lease already reclaimed -> report misses" }
   ]
 }

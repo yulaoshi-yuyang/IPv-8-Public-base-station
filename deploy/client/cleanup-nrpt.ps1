@@ -1,4 +1,4 @@
-# deploy/client/cleanup-nrpt.ps1
+﻿# deploy/client/cleanup-nrpt.ps1
 # ★ v9：PowerShell 语法完整修正版（$ 前缀、空格、插值、-ErrorAction 全名）
 #Requires -RunAsAdministrator
 

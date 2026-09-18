@@ -1,0 +1,8 @@
+[package]
+name = "ipv8-fec"
+description = "IPv8+ 隧道前向纠错：K 帧 XOR 恢复帧编解码与收发状态机（纯函数，零依赖）"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]

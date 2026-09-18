@@ -407,7 +407,7 @@ mod tests {
     use super::*;
 
     fn addr(n: u32) -> IPv8Address {
-        IPv8Address::new(64500, n, 1, 0, 1)
+        IPv8Address::with_region(n as u64, 1, 0, 0x0100, 0)
     }
 
     fn setup() -> (TrustAnchor, HostIdentity, HostIdentity) {

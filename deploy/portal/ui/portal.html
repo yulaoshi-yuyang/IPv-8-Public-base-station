@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="dark">
+<title>IPv8+ · 协议门户</title>
+<link rel="stylesheet" href="/ui/theme.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌐</text></svg>">
+</head>
+<body>
+
+<!-- ============ 顶部导航 ============ -->
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="#/">
+      <span class="brand-mark">V8</span>
+      <span>IPv8+</span>
+    </a>
+    <nav class="nav-links">
+      <button class="nav-link active" data-nav="home">首页</button>
+      <button class="nav-link" data-nav="docs">文档</button>
+      <button class="nav-link" data-nav="diagnose">诊断</button>
+      <button class="nav-link" data-nav="console">控制台</button>
+    </nav>
+    <span class="version-badge">v{{VERSION}}</span>
+  </div>
+</header>
+
+<!-- ============ 首页 ============ -->
+<main class="page active" id="page-home">
+ <div class="page-shell">
+  <section class="hero">
+    <canvas id="topology-canvas"></canvas>
+    <div class="hero-content">
+      <span class="hero-eyebrow">Protocol Portal</span>
+      <h1>128 位扩展地址空间的<br><span class="accent">IPv8+ 协议门户</span></h1>
+      <p>集成 GeoIP 查询、签证管理、跨机互连与节点诊断。基于 CA 签证的不可伪造地址体系，为每台设备绑定专属 fb14 地址。</p>
+      <div class="hero-actions">
+        <a class="btn btn-lg" href="#/docs/quickstart">快速开始</a>
+        <a class="btn btn-ghost btn-lg" href="#/diagnose">交互诊断</a>
+      </div>
+    </div>
+
+    <!-- GeoIP 查询 -->
+    <div class="geo-box">
+      <div class="geo-input-row">
+        <input type="text" id="geo-input" placeholder="输入 fb14 地址查询归属地，留空查询本机" autocomplete="off" spellcheck="false">
+        <button class="btn" id="geo-btn">查询</button>
+      </div>
+      <div id="geo-result"></div>
+    </div>
+  </section>
+
+  <!-- 地址结构交互拆解 -->
+  <section class="addr-section">
+    <div class="section-head">
+      <span class="section-eyebrow">Address Anatomy</span>
+      <h2>128 位地址，8 段含义</h2>
+      <p class="section-lead">每个 IPv8+ 地址由 16 字节线格式派生，分为 8 个 16 位段。点击任一段查看其协议含义。</p>
+    </div>
+    <div class="addr-explorer" id="addr-explorer">
+      <div class="addr-bar" id="addr-bar"></div>
+      <div class="addr-detail" id="addr-detail"></div>
+    </div>
+  </section>
+
+  <!-- 协议架构图解 -->
+  <section class="arch-section">
+    <div class="section-head">
+      <span class="section-eyebrow">How It Works</span>
+      <h2>从签发到互连，四层信任链</h2>
+      <p class="section-lead">CA 签证绑定机器指纹 → 派生不可伪造地址 → 隧道加密传输 → 本地 DNS 解析域名。</p>
+    </div>
+    <div class="arch-flow">
+      <div class="arch-step" data-step="0">
+        <div class="arch-icon">①</div>
+        <div class="arch-body">
+          <h3>CA 签证</h3>
+          <p>Ed25519 私钥对机器指纹+地址签名，生成 181 字节签证文件</p>
+        </div>
+      </div>
+      <div class="arch-arrow">→</div>
+      <div class="arch-step" data-step="1">
+        <div class="arch-icon">②</div>
+        <div class="arch-body">
+          <h3>地址派生</h3>
+          <p>从签证提取 fb14 地址，绑定到 wintun 虚拟网卡</p>
+        </div>
+      </div>
+      <div class="arch-arrow">→</div>
+      <div class="arch-step" data-step="2">
+        <div class="arch-icon">③</div>
+        <div class="arch-body">
+          <h3>隧道互连</h3>
+          <p>跨机信任握手后，数据包经虚拟网卡加密传输</p>
+        </div>
+      </div>
+      <div class="arch-arrow">→</div>
+      <div class="arch-step" data-step="3">
+        <div class="arch-icon">④</div>
+        <div class="arch-body">
+          <h3>DNS 解析</h3>
+          <p>本地 DNS 拦截 *.ipv8.net 查询，返回对应 IPv8 地址</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 网络状态实时面板 -->
+  <section class="status-section">
+    <div class="section-head">
+      <span class="section-eyebrow">Live Network</span>
+      <h2>网络实时状态</h2>
+      <p class="section-lead">从本机门户接口实时读取，每 5 秒刷新。</p>
+    </div>
+    <div class="status-grid" id="status-grid">
+      <div class="status-card">
+        <div class="status-label">在线状态</div>
+        <div class="status-value" id="net-status">—</div>
+      </div>
+      <div class="status-card">
+        <div class="status-label">本机地址</div>
+        <div class="status-value mono" id="net-ipv8">—</div>
+      </div>
+      <div class="status-card">
+        <div class="status-label">已连接客户端</div>
+        <div class="status-value" id="net-clients">—</div>
+      </div>
+      <div class="status-card">
+        <div class="status-label">签证状态</div>
+        <div class="status-value" id="net-visa">—</div>
+      </div>
+      <div class="status-card">
+        <div class="status-label">防火墙规则</div>
+        <div class="status-value" id="net-fw">—</div>
+      </div>
+      <div class="status-card">
+        <div class="status-label">DNS 服务</div>
+        <div class="status-value mono" id="net-dns">—</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 快速入口 -->
+  <section class="quick-grid">
+    <a class="quick-card" href="#/docs/quickstart">
+      <div class="quick-icon">▶</div>
+      <h3>快速开始</h3>
+      <p>三步接入 IPv8+ 网络：自动配置 → 启动服务 → 跨机互连</p>
+    </a>
+    <a class="quick-card" href="/api/client-package" download="ping8.exe">
+      <div class="quick-icon">↓</div>
+      <h3>下载客户端</h3>
+      <p>单文件 ping8.exe，包含签证、驱动、隧道、防火墙全部功能</p>
+    </a>
+    <a class="quick-card" href="#/diagnose">
+      <div class="quick-icon">◎</div>
+      <h3>交互诊断</h3>
+      <p>9 项检查网页可视化，逐步修复指引，一键定位连接问题</p>
+    </a>
+    <a class="quick-card" href="#/console">
+      <div class="quick-icon">▤</div>
+      <h3>控制台</h3>
+      <p>已连接客户端、跨机互连、本机信息、防火墙规则一站式管理</p>
+    </a>
+  </section>
+ </div>
+</main>
+
+<!-- ============ 文档中心 ============ -->
+<main class="page" id="page-docs">
+  <div class="docs-layout">
+    <aside class="docs-sidebar" id="docs-sidebar"></aside>
+    <article class="docs-content" id="docs-content"></article>
+    <aside class="docs-toc" id="docs-toc"></aside>
+  </div>
+</main>
+
+<!-- ============ 诊断向导 ============ -->
+<main class="page" id="page-diagnose">
+  <div class="wizard">
+    <h1>交互式诊断向导</h1>
+    <p class="wizard-lead">自动检测本机 IPv8+ 环境的 9 项关键指标，提供逐步修复指引。</p>
+    <div id="wizard-body"></div>
+  </div>
+</main>
+
+<!-- ============ 控制台 ============ -->
+<main class="page" id="page-console">
+  <div class="container" style="padding-top:32px">
+    <h1 style="font-size:1.8rem;font-weight:800;color:var(--text-strong);margin-bottom:8px">控制台</h1>
+    <p style="color:var(--text-muted);margin-bottom:8px">收纳旧管理功能：客户端列表、跨机互连、本机信息、防火墙规则。</p>
+
+    <div class="console-grid">
+
+      <!-- 已连接客户端 -->
+      <div class="console-card" style="grid-column:1/-1">
+        <h3>已连接客户端</h3>
+        <div id="console-clients-body">
+          <div style="text-align:center;color:var(--text-faint);padding:20px">加载中…</div>
+        </div>
+      </div>
+
+      <!-- 本机客户端信息 -->
+      <div class="console-card" style="grid-column:1/-1">
+        <h3>本机客户端信息 <span id="cli-source-badge" style="margin-left:auto"></span></h3>
+        <div class="info-grid">
+          <div class="info-item"><div class="label">IPv8 地址</div><div class="value" id="cli-ipv8">-</div></div>
+          <div class="info-item"><div class="label">IPv6</div><div class="value" id="cli-ipv6">-</div></div>
+          <div class="info-item"><div class="label">客户端版本</div><div class="value" id="cli-version">-</div></div>
+          <div class="info-item"><div class="label">DNS 服务</div><div class="value" id="cli-dns">-</div></div>
+        </div>
+
+        <h3 style="margin-top:24px">签证状态</h3>
+        <div class="info-grid">
+          <div class="info-item"><div class="label">签证文件</div><div class="value" id="srv-visa-exists">-</div></div>
+          <div class="info-item"><div class="label" id="srv-ca-label">CA 公钥</div><div class="value" id="srv-ca-exists">-</div></div>
+        </div>
+      </div>
+
+      <!-- 跨机互连 -->
+      <div class="console-card">
+        <h3>跨机互连</h3>
+        <div class="info-item" style="margin-bottom:14px">
+          <div class="label">本机 IP（告知对端使用此地址连接）</div>
+          <div class="value" id="cross-my-ip">获取中…</div>
+        </div>
+        <div class="alert alert-idle" style="font-size:.82rem;margin-bottom:14px">
+          <strong>使用方法：</strong><br>
+          1. 对端运行 <code>ping8 trust listen</code><br>
+          2. 填入对端 IP，点击「发送信任请求」<br>
+          3. 对端 CMD 弹出确认，输入 Y 同意<br>
+          4. 用 <code>ping8 ping</code> 测试连通性
+        </div>
+        <div class="field-row">
+          <input type="text" id="cross-peer-ip" placeholder="对端 IP，例如 2409:8938::1" autocomplete="off" spellcheck="false">
+          <input type="number" id="cross-peer-port" style="flex:0 0 110px" placeholder="端口" value="45801" min="1" max="65535">
+        </div>
+        <button class="btn" id="cross-start-btn">发送信任请求</button>
+        <div id="cross-status" style="margin-top:12px"></div>
+        <div id="cross-result" style="margin-top:10px"></div>
+      </div>
+
+      <!-- 防火墙规则 -->
+      <div class="console-card">
+        <h3>防火墙规则</h3>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px">
+          <div class="info-item"><div class="label">系统规则</div><div class="value" id="fw-total">0</div></div>
+          <div class="info-item"><div class="label">启用中</div><div class="value" style="color:var(--ok)" id="fw-active">0</div></div>
+          <div class="info-item"><div class="label">连接客户端</div><div class="value" id="fw-clients">0</div></div>
+        </div>
+        <div style="overflow-x:auto;margin-bottom:14px">
+          <table class="data-table">
+            <thead><tr><th>规则名称</th><th>方向</th><th>状态</th><th>配置</th></tr></thead>
+            <tbody id="fw-rules-body">
+              <tr><td colspan="4" style="text-align:center;color:var(--text-faint);padding:20px">加载中…</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-sm" data-fw="open">放行标准端口</button>
+          <button class="btn btn-sm btn-ghost" id="fw-refresh-btn">刷新</button>
+          <button class="btn btn-sm btn-danger" data-fw="close">清除端口规则</button>
+        </div>
+        <div id="firewall-result" style="margin-top:12px"></div>
+      </div>
+
+    </div>
+  </div>
+</main>
+
+<!-- ============ 404 ============ -->
+<main class="page" id="page-404">
+  <div class="not-found">
+    <div class="code">404</div>
+    <p>页面不存在</p>
+    <a class="btn" href="#/">返回首页</a>
+  </div>
+</main>
+
+<footer class="footer">IPv8+ 协议 · {{DOMAIN}} · {{YEAR}}</footer>
+
+<script>
+  // 服务端注入的本机 IPv8 地址，供首页 GeoIP 查询标记"这是你的地址"
+  window.IPV8_SELF = "{{IPV8_SELF}}";
+</script>
+<script src="/ui/docs-data.js"></script>
+<script src="/ui/topology.js"></script>
+<script src="/ui/wizard.js"></script>
+<script src="/ui/portal.js"></script>
+</body>
+</html>

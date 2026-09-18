@@ -22,7 +22,7 @@ const A2B: &[u8] = b"ping via grpc";
 const B2A: &[u8] = b"pong via grpc";
 
 fn addr(n: u32) -> IPv8Address {
-    IPv8Address::new(64500, n, 1, 0, 1)
+    IPv8Address::with_region(n as u64, 1, 0, 1, 0)
 }
 
 async fn spawn_engine(engine: Engine) -> (SocketAddr, Channel) {

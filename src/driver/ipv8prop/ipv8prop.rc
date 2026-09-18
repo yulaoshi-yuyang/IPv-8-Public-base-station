@@ -1,0 +1,47 @@
+// IPv8+ 协议属性页资源（Phase 5C）
+// 简体中文；文件保存为 UTF-8 BOM，#pragma code_page 双保险。
+#include <windows.h>
+#include <commctrl.h>
+#include "resource.h"
+
+LANGUAGE LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED
+#pragma code_page(65001)
+
+// DLL 私有 activation context：控件按 comctl32 v6 主题渲染
+2 RT_MANIFEST "ipv8prop.manifest"
+
+IDD_PAGE_GENERAL DIALOGEX 0, 0, 312, 220
+STYLE WS_CHILD | WS_VISIBLE | DS_SHELLFONT
+FONT 9, "MS Shell Dlg 2", 400, 0, 0x804
+BEGIN
+    LTEXT      "IPv8 地址由本机节点身份自动派生并经签发签名，在覆盖网络中端到端可达；无需手工设置地址、子网掩码或默认网关。",
+               IDC_INTRO, 7, 8, 298, 30
+    GROUPBOX   "本机 IPv8 身份", IDC_GRP_IDENTITY, 7, 40, 298, 60
+    LTEXT      "IPv8 地址(&I):", IDC_LBL_ADDR, 16, 56, 50, 10
+    EDITTEXT   IDC_EDIT_ADDR, 68, 53, 192, 14, ES_READONLY | ES_AUTOHSCROLL
+    PUSHBUTTON "复制(&C)", IDC_BTN_COPY, 266, 52, 32, 16
+    LTEXT      "签证有效期:", IDC_LBL_VISA, 16, 80, 50, 10
+    LTEXT      "", IDC_TXT_VISA, 68, 80, 228, 10
+    GROUPBOX   "名称解析", IDC_GRP_DNS, 7, 106, 298, 42
+    LTEXT      "*.ipv8.net 名称由 IPv8 网络直接解析（本机解析规则接管），不走运营商或公共 DNS。",
+               IDC_TXT_DNS, 16, 120, 280, 22
+    ICON       "", IDC_ICON_WARN, 10, 157, 16, 16
+    LTEXT      "", IDC_BANNER_NOVISA, 32, 155, 273, 42
+    LTEXT      "管理门户：https://ipv8.yulaoshi.xyz", IDC_TXT_PORTAL, 7, 200, 182, 12
+    PUSHBUTTON "打开 IPv8 管理界面(&M)…", IDC_BTN_PORTAL, 192, 196, 113, 16
+END
+
+IDD_PAGE_ADAPTERS DIALOGEX 0, 0, 312, 220
+STYLE WS_CHILD | WS_VISIBLE | DS_SHELLFONT
+FONT 9, "MS Shell Dlg 2", 400, 0, 0x804
+BEGIN
+    LTEXT      "", IDC_TXT_DRVSTATUS, 7, 10, 238, 12
+    PUSHBUTTON "刷新(&R)", IDC_BTN_REFRESH, 250, 7, 55, 14
+    ICON       "", IDC_ICON_ERR, 10, 31, 16, 16
+    LTEXT      "", IDC_BANNER_DRV, 32, 28, 273, 44
+    CONTROL    "", IDC_LIST, WC_LISTVIEWW,
+               LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP,
+               7, 28, 298, 176
+    LTEXT      "计数由 ipv8proto.sys 实时提供；适配器全名过长时，将指针悬停于名称查看。",
+               IDC_TXT_HINT, 7, 208, 298, 10
+END

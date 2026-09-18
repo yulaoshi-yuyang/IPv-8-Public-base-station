@@ -65,7 +65,7 @@ fn aead_seal_and_roundtrip_throughput() {
 #[test]
 #[ignore]
 fn fragment_reassemble_throughput() {
-    let src = IPv8Address::new(1, 1, 0, 0, 0);
+    let src = IPv8Address::with_region(1, 0, 0, 0, 0);
     let mut big = vec![0u8; 60_000];
     big[0] = 0x45;
     let hdr = IPv8Header::new(src, src, big.len() as u16);
@@ -106,11 +106,11 @@ fn fragment_reassemble_throughput() {
 #[test]
 #[ignore]
 fn routetrace_build_verify_cost() {
-    let hops = [IPv8Address::new(1, 2, 0, 0, 0), IPv8Address::new(1, 3, 0, 0, 0)];
+    let hops = [IPv8Address::with_region(2, 0, 0, 0, 0), IPv8Address::with_region(3, 0, 0, 0, 0)];
     let sk = ed25519_dalek::SigningKey::from_bytes(&[0xA1u8; 32]);
     let pk = sk.verifying_key().to_bytes();
     let spec = ipv8_routing::PathSpec {
-        src_addr: IPv8Address::new(1, 1, 0, 0, 0),
+        src_addr: IPv8Address::with_region(1, 0, 0, 0, 0),
         dst_addr: hops[1],
         min_compat_ver: 0,
         flags: 0x40,
@@ -131,7 +131,7 @@ fn routetrace_build_verify_cost() {
     for _ in 0..ROUNDS {
         // 验签主导项：消息体重建 + Ed25519 verify
         let msg = ipv8_codec::route_trace_message(&ipv8_codec::TraceSigInput {
-            src_addr: &IPv8Address::new(1, 1, 0, 0, 0),
+            src_addr: &IPv8Address::with_region(1, 0, 0, 0, 0),
             dst_addr: &hops[1],
             min_compat_ver: 0,
             flags: 0x40,
@@ -158,13 +158,13 @@ fn engine_loopback_data_plane() {
     for suite in [CipherSuite::ChaCha20Poly1305, CipherSuite::Aes256Gcm] {
         let mut alice = Engine::new(
             Identity::from_bytes([1u8; 32]),
-            IPv8Address::new(1, 1, 0, 0, 0),
-            IPv8Address::new(1, 2, 0, 0, 0),
+            IPv8Address::with_region(1, 0, 0, 0, 0),
+            IPv8Address::with_region(2, 0, 0, 0, 0),
         );
         let mut bob = Engine::new(
             Identity::from_bytes([2u8; 32]),
-            IPv8Address::new(1, 2, 0, 0, 0),
-            IPv8Address::new(1, 1, 0, 0, 0),
+            IPv8Address::with_region(2, 0, 0, 0, 0),
+            IPv8Address::with_region(1, 0, 0, 0, 0),
         );
         alice.set_cipher_suite(suite);
         bob.set_cipher_suite(suite);
@@ -277,13 +277,13 @@ fn flow_shards_scaling() {
 fn plain_pair(suite: CipherSuite) -> (Engine, Engine) {
     let mut alice = Engine::new(
         Identity::from_bytes([1u8; 32]),
-        IPv8Address::new(1, 1, 0, 0, 0),
-        IPv8Address::new(1, 2, 0, 0, 0),
+        IPv8Address::with_region(1, 0, 0, 0, 0),
+        IPv8Address::with_region(2, 0, 0, 0, 0),
     );
     let mut bob = Engine::new(
         Identity::from_bytes([2u8; 32]),
-        IPv8Address::new(1, 2, 0, 0, 0),
-        IPv8Address::new(1, 1, 0, 0, 0),
+        IPv8Address::with_region(2, 0, 0, 0, 0),
+        IPv8Address::with_region(1, 0, 0, 0, 0),
     );
     alice.set_cipher_suite(suite);
     bob.set_cipher_suite(suite);

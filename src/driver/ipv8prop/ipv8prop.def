@@ -1,0 +1,11 @@
+; IPv8 notify object DLL 导出表
+; （DllGetClassObject / DllCanUnloadNow 已在 objbase.h 声明，
+;   代码内再标 __declspec(dllexport) 会触发 C2375 链接规格冲突，
+;   故统一经 .def 导出。PRIVATE：仍在 DLL 导出表（COM/regsvr32 经
+;   GetProcAddress 取用），只是不进导入库，消除 LNK4104。）
+LIBRARY ipv8prop
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE
+    DllRegisterServer PRIVATE
+    DllUnregisterServer PRIVATE

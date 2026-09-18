@@ -342,7 +342,7 @@ mod tests {
     use crate::{encode, ExtType, IPv8Address, IPv8Header};
 
     fn addr(n: u8) -> IPv8Address {
-        IPv8Address::new(1, n as u32, 0, 0, 0)
+        IPv8Address::with_region(n as u64, 0, 0, 0, 0)
     }
 
     fn big_packet(payload_len: usize) -> Vec<u8> {

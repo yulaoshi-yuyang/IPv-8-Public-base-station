@@ -201,14 +201,17 @@ pub fn route_trace_message(i: &TraceSigInput<'_>) -> Vec<u8> {
     m
 }
 
-/// 16 字节线格式 → 地址（Reserved 接收忽略，§3.1/§2.2）
+/// 16 字节线格式 → 地址
 fn addr_from_wire(b: &[u8]) -> IPv8Address {
     IPv8Address::new(
-        u32::from_be_bytes(b[0..4].try_into().unwrap()),
-        u32::from_be_bytes(b[4..8].try_into().unwrap()),
+        u16::from_be_bytes(b[0..2].try_into().unwrap()),
+        u16::from_be_bytes(b[2..4].try_into().unwrap()),
+        u16::from_be_bytes(b[4..6].try_into().unwrap()),
+        u16::from_be_bytes(b[6..8].try_into().unwrap()),
         u16::from_be_bytes(b[8..10].try_into().unwrap()),
         u16::from_be_bytes(b[10..12].try_into().unwrap()),
-        b[12],
+        u16::from_be_bytes(b[12..14].try_into().unwrap()),
+        u16::from_be_bytes(b[14..16].try_into().unwrap()),
     )
 }
 
@@ -371,7 +374,7 @@ mod tests {
     use crate::header::{ExtensionHeader, IPv8Header};
 
     fn addr(n: u32) -> IPv8Address {
-        IPv8Address::new(0xfb14, n, 1, 0x2a, 1)
+        IPv8Address::with_region(n as u64, 1, 0x2a, 1, 0)
     }
 
     #[test]

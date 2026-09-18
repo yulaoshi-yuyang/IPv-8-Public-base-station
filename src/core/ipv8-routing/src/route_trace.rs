@@ -226,7 +226,7 @@ mod tests {
     use ipv8_codec::ROUTE_TRACE_DOMAIN;
 
     fn a(n: u32) -> IPv8Address {
-        IPv8Address::new(0xfb14, n, 1, 0, 1)
+        IPv8Address::with_region(n as u64, 1, 0, 0x0100, 0)
     }
 
     /// 造 120B 证书线格式：ca_seed 给 (addr,pub,not_after) 签名

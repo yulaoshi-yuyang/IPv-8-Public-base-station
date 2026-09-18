@@ -35,6 +35,8 @@ pub enum FrameType {
     AuthInit = 4,
     /// 证书认证握手 Resp（帧体 = AUTH_BUNDLE_LEN 认证束）
     AuthResp = 5,
+    /// FEC XOR 恢复帧（Phase 4，帧体见 ipv8-fec crate；引擎不处理，node 层分流）
+    FecRecovery = 6,
 }
 
 impl FrameType {
@@ -46,6 +48,7 @@ impl FrameType {
             3 => Some(Self::Rekey),
             4 => Some(Self::AuthInit),
             5 => Some(Self::AuthResp),
+            6 => Some(Self::FecRecovery),
             _ => None,
         }
     }
@@ -192,5 +195,20 @@ mod tests {
             parse_head(&[0x01, 9, 0, 0, 0, 0, 0, 0, 0, 0]),
             Err(FrameError::BadType(9))
         );
+    }
+
+    #[test]
+    fn parse_head_type6_roundtrip() {
+        // Phase 4：FecRecovery=6 解析往返；0-5 帧既有断言不受影响
+        let mut f = Vec::new();
+        write_head(&mut f, FrameType::FecRecovery, &[0x11; 8]);
+        assert_eq!(f[1], 6);
+        let h = parse_head(&f).expect("Type=6 必须可解析");
+        assert_eq!(h.frame_type, FrameType::FecRecovery);
+        assert_eq!(h.key_id, [0x11; 8]);
+        // 越界类型仍拒绝
+        let mut bad = f;
+        bad[1] = 7;
+        assert!(matches!(parse_head(&bad), Err(FrameError::BadType(7))));
     }
 }

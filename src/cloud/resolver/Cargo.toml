@@ -11,13 +11,25 @@ path = "src/main.rs"
 
 [dependencies]
 ipv8-codec = { workspace = true }
+ipv8-routing = { path = "../../core/ipv8-routing" }
 ed25519-dalek = { workspace = true }
 tonic = { version = "0.12", features = ["transport"] }
 prost = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rusqlite = { version = "0.31", features = ["bundled"] }
+ahash = "0.8"
+smallvec = "1"
+mimalloc = "0.1"
+lru = "0.12"
+parking_lot = "0.12"
 
 [build-dependencies]
 tonic-build = "0.12"
 protox = "0.7"
 prost-types = "0.13"
+
+[dev-dependencies]
+ipv8-routing = { path = "../../core/ipv8-routing", features = ["test-utils"] }

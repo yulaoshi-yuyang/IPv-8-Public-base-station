@@ -1,0 +1,126 @@
+;/*++
+
+Copyright (c) IPv8+ Project. All rights reserved.
+
+Module Name:
+
+    ipv8proto.inf
+
+Abstract:
+
+    INF for installing the IPv8 NDIS 6.30 Protocol Driver (Phase 5A).
+    Makes "Internet 协议版本 8 (TCP/IPv8)" appear in the network adapter
+    properties list, alongside IPv4/IPv6.
+
+    结构对齐微软官方 NDIS 6.30 协议样例 ndisprot630.inf：
+      - Class=NetTrans / ClassGUID {4d36e975-...}
+      - 单一 NTamd64 models 装饰（匹配全部 x64 Windows）
+      - AddService 无标志，DelService 仅卸载/回滚执行
+      - 传统 DIRID 布局：sys -> 12(system32\drivers)，属性页 dll -> 11(system32)
+
+    安装（管理员）：netcfg -l ipv8proto.inf -c p -i IPv8Proto
+
+--*/
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = NetTrans
+ClassGUID   = {4d36e975-e325-11ce-bfc1-08002be10318}
+Provider    = %IPv8_Provider%
+DriverVer   = 09/17/2026,0.11.0.0
+CatalogFile = ipv8proto.cat
+
+; =============================================================================
+; Manufacturer / Models
+;   netcfg -c p -i IPv8Proto 以服务名小写（ipv8proto）作为硬件 ID 搜索，
+;   models 段硬件 ID 必须与之匹配。
+; =============================================================================
+
+[Manufacturer]
+%IPv8_Provider% = IPv8, NTamd64
+
+[IPv8.NTamd64]
+%IPv8_ProtocolDesc% = IPv8_Install, ipv8proto
+
+; =============================================================================
+; Installation section
+;   Characteristics 0x80 = NCF_HAS_UI：列入连接属性并启用“属性”按钮
+; =============================================================================
+
+[IPv8_Install]
+Characteristics = 0x80
+AddReg          = IPv8_AddReg
+CopyFiles       = IPv8_CopyFiles.Sys, IPv8_CopyFiles.Dll
+
+[IPv8_Install.Services]
+AddService = %IPv8_ServiceName%,, IPv8_ServiceInst
+
+; 仅在卸载或安装失败回滚时执行；0x200 = SPSVCINST_STOPSERVICE（先停再删）
+[IPv8_Install.Remove.Services]
+DelService = %IPv8_ServiceName%, 0x200
+
+[IPv8_ServiceInst]
+DisplayName    = %IPv8_ProtocolDesc%
+ServiceType    = 1   ; SERVICE_KERNEL_DRIVER
+StartType      = 2   ; SERVICE_AUTO_START（协议组件开机即绑定可用）
+ErrorControl   = 1   ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\ipv8proto.sys
+
+; =============================================================================
+; Copy files（,,,2 = COPYFLAG_WARN_IF_SKIP，对齐官方样例）
+; =============================================================================
+
+[IPv8_CopyFiles.Sys]
+ipv8proto.sys,,,2
+
+[IPv8_CopyFiles.Dll]
+ipv8prop.dll,,,2
+
+; =============================================================================
+; Registry settings
+; =============================================================================
+
+[IPv8_AddReg]
+HKR, Ndi,            Service,     0, %IPv8_ServiceName%
+HKR, Ndi,            HelpText,    0, %IPv8_HelpText%
+HKR, Ndi\Interfaces, UpperRange,  0, "noupper"
+HKR, Ndi\Interfaces, LowerRange,  0, "ndis5"
+HKR, Ndi,            FrameType,   0, "0xFB14"
+
+; notify object：netcfgx 经 Clsid CoCreate / ComponentDll 定位 DLL，
+; INetCfgComponentPropertyUi::MergePropPages 提供"属性"按钮页面。
+; （Ndi\PropertyPages 注册表机制 Win11 netshell 不读取，已弃用。）
+HKR, Ndi,            ComponentDll, 0, "ipv8prop.dll"
+HKR, Ndi,            Clsid,        0, "{7E5F3A9C-1D64-4B2E-9C38-A50F8E2D6B71}"
+
+; =============================================================================
+; Destination directories
+;   12 = %windir%\system32\drivers ; 11 = %windir%\system32
+; =============================================================================
+
+[DestinationDirs]
+IPv8_CopyFiles.Sys = 12
+IPv8_CopyFiles.Dll = 11
+DefaultDestDir      = 12
+
+; =============================================================================
+; Source disk layout
+; =============================================================================
+
+[SourceDisksNames]
+1 = %SourceDisk%,,,
+
+[SourceDisksFiles]
+ipv8proto.sys = 1
+ipv8prop.dll  = 1
+
+; =============================================================================
+; Strings
+; =============================================================================
+
+[Strings]
+IPv8_Provider      = "IPv8+ Project"
+IPv8_ProtocolDesc  = "Internet 协议版本 8 (TCP/IPv8)"
+IPv8_ServiceName   = "IPv8Proto"
+IPv8_HelpText      = "IPv8+ 协议驱动：基于身份的覆盖网络协议，提供端到端加密、多跳路由与能力寻址"
+SourceDisk         = "IPv8 Protocol Driver Installation Disk"

@@ -24,8 +24,8 @@ $log = Join-Path $env:TEMP 'ipv8-notun-selftest'
 New-Item -ItemType Directory -Force -Path $log | Out-Null
 $la = Join-Path $log 'A.out'; $lb = Join-Path $log 'B.out'
 Remove-Item $la, $lb, (Join-Path $log 'A.err'), (Join-Path $log 'B.err') -ErrorAction SilentlyContinue
-$addrA = '0000fb140000000a0001000001000000'
-$addrB = '0000fb140000000b0001000001000000'
+$addrA = 'fb140000000a00010000010000000000'
+$addrB = 'fb140000000b00010000010000000000'
 $ca = 'C4' * 32
 if (-not (Test-Path $Exe)) { Write-Host "missing $Exe"; exit 1 }
 
@@ -34,13 +34,13 @@ $pb = Start-Process $Exe -PassThru -WindowStyle Hidden `
       -RedirectStandardOutput $lb -RedirectStandardError (Join-Path $log 'B.err') `
       -ArgumentList @('--self',$addrB,'--peer-addr',$addrA,'--peer-ip','127.0.0.1',
                       '--udp-port','45801','--peer-port','45800','--no-tun','--learn-peer',
-                      '--nt-size',"$NtSize",
+                      '--nt-size',"$NtSize",'--rio','off',
                       '--auth','--ca-seed',$ca,'--ed-seed',('B0'*32))
 # A: initiator, no-tun, injects synthetic packets after Established
 $pa = Start-Process $Exe -PassThru -WindowStyle Hidden `
       -RedirectStandardOutput $la -RedirectStandardError (Join-Path $log 'A.err') `
       -ArgumentList @('--self',$addrA,'--peer-addr',$addrB,'--peer-ip','127.0.0.1',
-                      '--udp-port','45800','--peer-port','45801','--no-tun','--initiate','--nt-size',"$NtSize",
+                      '--udp-port','45800','--peer-port','45801','--no-tun','--initiate','--nt-size',"$NtSize",'--rio','off',
                       '--auth','--ca-seed',$ca,'--ed-seed',('A1'*32))
 
 $ok = $false; $atxt = ''

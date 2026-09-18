@@ -550,7 +550,7 @@ mod tests {
     const FOREVER: u64 = u64::MAX - 1;
 
     fn addr(n: u32) -> IPv8Address {
-        IPv8Address::new(64500, n, 1, 0, 1)
+        IPv8Address::with_region(n as u64, 1, 0, 0x0100, 0)
     }
     fn text(n: u32) -> String {
         addr(n).to_canonical_string()
@@ -600,10 +600,10 @@ mod tests {
                 name: self.name.clone(),
                 addr: self.a,
                 capabilities: self.caps.clone(),
-                endpoints: vec![format!("10.0.0.{}:45700", self.a.host_id)],
+                endpoints: vec![format!("10.0.0.{}:45700", self.a.region_lo)],
                 qos_hint: self.qos,
                 not_after,
-                tunnel_entry: format!("192.0.2.{}:45700", self.a.host_id),
+                tunnel_entry: format!("192.0.2.{}:45700", self.a.region_lo),
             }
         }
     }

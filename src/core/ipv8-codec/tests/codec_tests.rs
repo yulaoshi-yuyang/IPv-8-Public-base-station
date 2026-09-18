@@ -7,11 +7,11 @@
 use ipv8_codec::*;
 
 fn addr_full() -> IPv8Address {
-    IPv8Address::new(0x0102_0304, 0x0A0B_0C0D, 0x1122, 0x3344, 0x02)
+    IPv8Address::new(0xFB14, 0x0304, 0x0A0B, 0x0C0D, 0x1122, 0x3344, 0x0200, 0x0000)
 }
 
 fn addr_min() -> IPv8Address {
-    IPv8Address::new(0, 1, 0, 0, 0)
+    IPv8Address::new(0xFB14, 0, 0, 0, 0, 0, 0, 0)
 }
 
 /// ★ 协议契约测试：钉死 40 字节线格式，任何布局改动都会让此测试红
@@ -28,10 +28,10 @@ fn wire_format_fixture() {
         0x00, 0x04,                   // PayloadLen @3-4
         0x40,                         // HopLimit @5
         0x00,                         // NextHeader @6
-        // SrcAddr @7-22
-        0x01, 0x02, 0x03, 0x04, 0x0A, 0x0B, 0x0C, 0x0D, 0x11, 0x22, 0x33, 0x44, 0x02, 0x00, 0x00, 0x00,
-        // DstAddr @23-38（asn=0, host_id=1 大端 → 字节 27-30）
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // SrcAddr @7-22 (protocol=0xFB14, region=0x03040A0B0C0D, subnet1=0x1122, subnet2=0x3344, node_hash=0x0200, session=0)
+        0xFB, 0x14, 0x03, 0x04, 0x0A, 0x0B, 0x0C, 0x0D, 0x11, 0x22, 0x33, 0x44, 0x02, 0x00, 0x00, 0x00,
+        // DstAddr @23-38 (protocol=0xFB14, all-zero region/subnet/node/session)
+        0xFB, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00,                         // 对齐填充 @39
     ];
     assert_eq!(&pkt[..40], &expect[..]);
@@ -127,11 +127,11 @@ fn decode_rejects_malformed() {
     pkt[0] = 0x60; // Version=6
     assert_eq!(decode(&pkt), Err(DecodeError::BadVersion(6)));
 
-    // 地址 reserved 非零 → 接收方忽略（不丢包），内存中清零
+    // 地址字段全量解析（新格式无 reserved，所有字节都有语义）
     let mut pkt = encode(&IPv8Header::new(addr_min(), addr_min(), 0), &[]).unwrap();
-    pkt[20] = 0xFF; // SrcAddr 的 Reserved 第 2 字节
+    pkt[20] = 0xFF; // SrcAddr node_hash 高字节
     let d = decode(&pkt).unwrap();
-    assert_eq!(d.header.src_addr.reserved, [0; 3]);
+    assert_ne!(d.header.src_addr.node_hash, 0); // 忠实读取，不清零
 
     // 填充字节非零 → 接收方忽略
     let mut pkt = encode(&IPv8Header::new(addr_min(), addr_min(), 0), &[]).unwrap();
@@ -199,14 +199,14 @@ fn version_negotiation() {
 #[test]
 fn address_canonical_text() {
     // spec §3.2：16 字节大端、32 个小写十六进制、不压缩零
-    let a = IPv8Address::new(0x0102_0304, 0x0A0B_0C0D, 0x1122, 0x3344, 0x02);
-    // asn(8) host(8) dev(4) cap(4) sec(2) reserved(6) = 32 位
-    assert_eq!(a.to_canonical_string(), "010203040a0b0c0d1122334402000000");
-    let zero = IPv8Address::new(0, 0, 0, 0, 0);
-    assert_eq!(zero.to_canonical_string(), "0".repeat(32));
+    // 新格式：protocol(4) + region(12) + subnet1(4) + subnet2(4) + node_hash(4) + session(4) = 32 hex
+    let a = IPv8Address::new(0xFB14, 0x0304, 0x0A0B, 0x0C0D, 0x1122, 0x3344, 0x0200, 0x0000);
+    assert_eq!(a.to_canonical_string(), "fb1403040a0b0c0d1122334402000000");
+    let zero = IPv8Address::new(0xFB14, 0, 0, 0, 0, 0, 0, 0);
+    assert_eq!(zero.to_canonical_string(), "fb140000000000000000000000000000");
 
     // 往返 + 大小写不敏感
-    let back = IPv8Address::from_canonical_str("010203040A0B0C0D1122334402000000").unwrap();
+    let back = IPv8Address::from_canonical_str("FB1403040A0B0C0D1122334402000000").unwrap();
     assert_eq!(back, a);
 
     // 非法输入
@@ -215,9 +215,10 @@ fn address_canonical_text() {
         IPv8Address::from_canonical_str(&format!("{}g00000", "0".repeat(25))),
         Err(AddrParseError::Format)
     );
+    // Protocol Magic 不对 → BadProtocol
     assert_eq!(
         IPv8Address::from_canonical_str("010203040a0b0c0d1122334402ff0000"),
-        Err(AddrParseError::ReservedNonZero)
+        Err(AddrParseError::BadProtocol)
     );
 }
 
@@ -238,8 +239,16 @@ fn property_roundtrip_random() {
         (state >> 33) as u32
     };
     for _ in 0..1000 {
-        let src = IPv8Address::new(next(), next(), next() as u16, next() as u16, next() as u8);
-        let dst = IPv8Address::new(next(), next(), next() as u16, next() as u16, next() as u8);
+        let src = IPv8Address::new(
+            0xFB14,
+            next() as u16, next() as u16, next() as u16,
+            next() as u16, next() as u16, next() as u16, next() as u16,
+        );
+        let dst = IPv8Address::new(
+            0xFB14,
+            next() as u16, next() as u16, next() as u16,
+            next() as u16, next() as u16, next() as u16, next() as u16,
+        );
         let plen = (next() % 1392) as u16; // 一个 MTU 内的典型载荷
         let mut hdr = IPv8Header::new(src, dst, plen);
         hdr.flags = (next() % 16) as u16

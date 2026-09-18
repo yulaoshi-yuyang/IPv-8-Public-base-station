@@ -12,3 +12,5 @@ ed25519-dalek = { workspace = true }
 [features]
 # Chord 自主路由骨架（v9 规划但 ADR-019 决议不进本轮验收）
 chord = []
+# 暴露进程内 RPC 测试脚手架（供其他 crate 写 DHT 集成测试用）
+test-utils = []

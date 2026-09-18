@@ -290,7 +290,7 @@ mod tests {
         [n; 32]
     }
     fn addr_text(n: u32) -> String {
-        IPv8Address::new(64500, n, 1, 0, 1).to_canonical_string()
+        IPv8Address::with_region(n as u64, 1, 0, 0x0100, 0).to_canonical_string()
     }
 
     fn reg_pop(sk: &SigningKey, text: &str) -> ([u8; 32], [u8; 64]) {

@@ -10,12 +10,12 @@ use std::net::UdpSocket;
 
 use ed25519_dalek::{Signer, SigningKey};
 use ipv8_codec::{encode, flags, ExtType, ExtensionHeader, IPv8Address, IPv8Header};
-use ipv8_routing::{build_route_trace, PathSpec};
+use ipv8_routing::{build_route_trace, PathSpec, StaticRouter, Router};
 use ipv8_tunnel::auth::{provision, CertAuthority, TrustAnchor, NO_EXPIRY};
 use ipv8_tunnel::{Engine, State};
 
 fn addr(n: u32) -> IPv8Address {
-    IPv8Address::new(64500, n, 1, 0, 1)
+    IPv8Address::with_region(n as u64, 1, 0, 1, 0)
 }
 
 const NOW: u64 = 1_700_000_000;
@@ -293,4 +293,184 @@ fn agentcard_header_survives_tunnel_aead() {
     let mut evil2 = frame.clone();
     evil2[10 + 40 + 2] ^= 0x80;
     assert!(decapsulate(&mut rx, &evil2).is_err());
+}
+
+// =========================================================================
+// P1：自动路径发现 + 端到端多跳（寻址 → 路由 → 转发 闭环验证）
+// =========================================================================
+
+/// P1 核心验收：3 节点场景（A → R → B），路径由 StaticRouter 自动发现
+/// （BFS 最短路径），而非手动硬编码。验证完整闭环：
+///   寻址（我要发给谁）→ 路由（Router::path_to 自动算路径）
+///   → 转发（seal_multihop 签路径 → 中转验证 → 目的地交付）
+#[test]
+fn p1_auto_route_three_node_a_to_r_to_b() {
+    let an = anchors();
+    let a_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let ra_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let rb_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let b_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let ra_addr = ra_sock.local_addr().unwrap();
+    let b_addr = b_sock.local_addr().unwrap();
+
+    let mut n = nodes(&an, true);
+    auth_handshake(&a_sock, &mut n.a, ra_addr, &ra_sock, &mut n.r_a);
+    auth_handshake(&rb_sock, &mut n.r_b, b_addr, &b_sock, &mut n.b);
+
+    // ── 路由层：构造拓扑 + BFS 自动算路径 ──
+    let mut router = StaticRouter::new(addr(1));
+    router.add_link(addr(1), addr(2)); // A ↔ R
+    router.add_link(addr(2), addr(3)); // R ↔ B
+
+    let path = router.path_to(addr(3)).expect("A→B 应有路径");
+    assert_eq!(path, vec![addr(2), addr(3)], "最短路径应为 A→R→B");
+
+    // ── 数据面：用自动发现的路径发多跳包 ──
+    let inner = vec![0x45u8, 0x00, 0x00, 0x20, b'p', b'1', b'-', b'o', b'k'];
+    let frames = n.a.seal_multihop(&inner, addr(3), &path, 64).unwrap();
+    assert_eq!(frames.len(), 1);
+    for f in &frames {
+        a_sock.send_to(f, ra_addr).unwrap();
+    }
+
+    // R 中转：验证 → 减跳 → 经 R→B 隧道续程
+    pump(&ra_sock, &mut n.r_a);
+    assert_eq!(n.r_a.take_delivered(), None, "中转不交付本机");
+    assert_eq!(n.r_a.stats().forwarded, 1, "合法多跳包应放行: {:?}", n.r_a.stats());
+    let (next, fwd_pkt) = n.r_a.take_forward_packet().unwrap();
+    assert_eq!(next, addr(3), "下一跳应为 B");
+    assert_eq!(fwd_pkt[5], 63, "HopLimit 应从 64 减为 63");
+
+    let frame = n.r_b.seal_prebuilt(&fwd_pkt).unwrap();
+    rb_sock.send_to(&frame, b_addr).unwrap();
+
+    // B 目的地：三验后交付
+    pump(&b_sock, &mut n.b);
+    assert_eq!(n.b.take_delivered().as_deref(), Some(&inner[..]));
+    assert_eq!(n.b.stats().fwd_rejected, 0);
+    assert_eq!(n.b.stats().dropped_inbound, 0);
+}
+
+/// P1 路由正确性：4 节点拓扑有多条路径时，BFS 选最短路径。
+/// 拓扑：A — R1 — B
+///            \      /
+///             R2 — R3（绕远路，3 跳）
+/// BFS 应选 A→R1→B（2 跳）而非 A→R2→R3→B（3 跳）
+#[test]
+fn p1_bfs_picks_shortest_path_in_four_node_topo() {
+    let (a, r1, r2, r3, b) = (addr(1), addr(2), addr(3), addr(4), addr(5));
+    let mut router = StaticRouter::new(a);
+
+    // 构造多路径拓扑
+    router.add_link(a, r1);    // 近路：A → R1
+    router.add_link(r1, b);    // 近路：R1 → B（总 2 跳）
+    router.add_link(a, r2);    // 远路：A → R2
+    router.add_link(r2, r3);   // 远路：R2 → R3
+    router.add_link(r3, b);    // 远路：R3 → B（总 3 跳）
+
+    let path = router.path_to(b).expect("应有路径");
+    assert_eq!(
+        path,
+        vec![r1, b],
+        "BFS 应选最短路径 A→R1→B（2 跳），实际: {path:?}"
+    );
+    assert_eq!(path.len(), 2, "最短路径跳数应为 2");
+}
+
+/// P1 无路径场景：目的地不可达时 path_to 返回 None，
+/// 调用方应走 noroute 逻辑（不发包、不建立隧道）。
+#[test]
+fn p1_unreachable_dst_returns_none() {
+    let (a, r, b) = (addr(1), addr(2), addr(3));
+    let mut router = StaticRouter::new(a);
+    router.add_link(a, r); // 只有 A↔R，R↔B 未连通
+
+    assert!(router.path_to(b).is_none(), "B 不可达应返回 None");
+    assert!(router.path_to(addr(99)).is_none(), "未知节点应返回 None");
+}
+
+/// P1 完整闭环：4 节点拓扑 + 真实 UDP + 自动路由，验证
+/// "寻址 → BFS 路由 → seal_multihop → 两跳中转 → 交付"。
+/// 拓扑：A — R1 — R2 — B（线性 3 跳）
+#[test]
+fn p1_auto_route_four_node_linear_chain() {
+    let an = anchors();
+    let ca = &an.ca;
+    let trust = &an.trust;
+
+    // 4 个节点 × 各有一个面向邻居的引擎
+    let host_a = provision(ca, addr(1), A_SEED, NO_EXPIRY);
+    let host_r1a = provision(ca, addr(2), [0x21u8; 32], NO_EXPIRY);
+    let host_r1b = provision(ca, addr(2), [0x22u8; 32], NO_EXPIRY);
+    let host_r2a = provision(ca, addr(3), [0x31u8; 32], NO_EXPIRY);
+    let host_r2b = provision(ca, addr(3), [0x32u8; 32], NO_EXPIRY);
+    let host_b = provision(ca, addr(4), [0x40u8; 32], NO_EXPIRY);
+
+    let mut a_r1 = Engine::authenticated(host_a, trust.clone(), addr(1), addr(2));
+    let mut r1_a = Engine::authenticated(host_r1a, trust.clone(), addr(2), addr(1));
+    let mut r1_r2 = Engine::authenticated(host_r1b, trust.clone(), addr(2), addr(3));
+    let mut r2_r1 = Engine::authenticated(host_r2a, trust.clone(), addr(3), addr(2));
+    let mut r2_b = Engine::authenticated(host_r2b, trust.clone(), addr(3), addr(4));
+    let mut b_r2 = Engine::authenticated(host_b, trust.clone(), addr(4), addr(3));
+
+    r1_a.enable_forwarding(an.anchor);
+    r1_r2.enable_forwarding(an.anchor);
+    r2_r1.enable_forwarding(an.anchor);
+    b_r2.enable_forwarding(an.anchor);
+
+    // 4 个 UDP socket（A / R1 / R2 / B）
+    let a_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let r1_sock_a = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let r1_sock_b = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let r2_sock_a = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let r2_sock_b = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let b_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+    let r1a_addr = r1_sock_a.local_addr().unwrap();
+    let r2a_addr = r2_sock_a.local_addr().unwrap();
+    let b_addr = b_sock.local_addr().unwrap();
+
+    // 建立 3 条隧道：A↔R1、R1↔R2、R2↔B
+    auth_handshake(&a_sock, &mut a_r1, r1a_addr, &r1_sock_a, &mut r1_a);
+    auth_handshake(&r1_sock_b, &mut r1_r2, r2a_addr, &r2_sock_a, &mut r2_r1);
+    auth_handshake(&r2_sock_b, &mut r2_b, b_addr, &b_sock, &mut b_r2);
+
+    // ── 路由层：线性拓扑 A—R1—R2—B，BFS 自动算路径 ──
+    let mut router = StaticRouter::new(addr(1));
+    router.add_link(addr(1), addr(2));
+    router.add_link(addr(2), addr(3));
+    router.add_link(addr(3), addr(4));
+
+    let path = router.path_to(addr(4)).expect("A→B 应有路径");
+    assert_eq!(path, vec![addr(2), addr(3), addr(4)], "路径应为 R1→R2→B");
+
+    // ── 数据面：A 发 → R1 转 → R2 转 → B 收 ──
+    let inner = vec![0x45u8, 0x00, 0x00, 0x18, b'4', b'h', b'o', b'p'];
+    let frames = a_r1.seal_multihop(&inner, addr(4), &path, 64).unwrap();
+    assert_eq!(frames.len(), 1);
+    a_sock.send_to(&frames[0], r1a_addr).unwrap();
+
+    // 第 1 跳：R1 中转
+    pump(&r1_sock_a, &mut r1_a);
+    assert_eq!(r1_a.stats().forwarded, 1);
+    let (next1, fwd1) = r1_a.take_forward_packet().unwrap();
+    assert_eq!(next1, addr(3), "R1 的下一跳应为 R2");
+    assert_eq!(fwd1[5], 63, "HopLimit 64 → 63");
+    let f1 = r1_r2.seal_prebuilt(&fwd1).unwrap();
+    r1_sock_b.send_to(&f1, r2a_addr).unwrap();
+
+    // 第 2 跳：R2 中转
+    pump(&r2_sock_a, &mut r2_r1);
+    assert_eq!(r2_r1.stats().forwarded, 1);
+    let (next2, fwd2) = r2_r1.take_forward_packet().unwrap();
+    assert_eq!(next2, addr(4), "R2 的下一跳应为 B");
+    assert_eq!(fwd2[5], 62, "HopLimit 63 → 62");
+    let f2 = r2_b.seal_prebuilt(&fwd2).unwrap();
+    r2_sock_b.send_to(&f2, b_addr).unwrap();
+
+    // 目的地：B 交付
+    pump(&b_sock, &mut b_r2);
+    assert_eq!(b_r2.take_delivered().as_deref(), Some(&inner[..]));
+    assert_eq!(b_r2.stats().fwd_rejected, 0);
+    assert_eq!(b_r2.stats().dropped_inbound, 0);
 }

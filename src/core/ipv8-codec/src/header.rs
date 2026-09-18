@@ -30,25 +30,93 @@ pub const MAX_EXT_CHAIN: usize = 64;
 
 /// IPv8+ 地址（128 位）
 ///
-/// 线格式（大端）：ASN(0-3) HostID(4-7) DeviceID(8-9) CapTag(10-11)
-/// SecLevel(12) Reserved(13-15，必须为 0)
+/// 改进格式（v9.1）——零浪费、层级路由、NAT 专用字段：
+/// ```text
+/// fb14 : RRRR : RRRR : RRRR : SSSS : SSSS : NNNN : TTTT : XXXX
+///   │      │      │      │      │      │      │      │      │
+///   │      │      │      │      │      │      │      │      └ Service/Interface (16 bit)
+///   │      │      │      │      │      │      │      └ Session ID (16 bit, 0=静态)
+///   │      │      │      │      │      │      └ Node Hash (16 bit, 公钥指纹截断)
+///   │      │      │      │      │      └ Subnet ID 2 (16 bit)
+///   │      │      │      │      └ Subnet ID 1 (16 bit)
+///   │      │      └──────────────└ Region ID (48 bit, 全球路由)
+///   └ Protocol Magic (16 bit, 0xFB14 = IPv8)
+/// ```
+///
+/// 线格式（大端）：
+///   Protocol(0-1) Region(2-7) Subnet1(8-9) Subnet2(10-11)
+///   NodeHash(12-13) SessionID(14-15) Service(16-17)  → wait, that's 18 bytes
+///
+/// 实际线格式（16 字节）：
+///   Protocol(0-1) RegionHi(2-3) RegionMid(4-5) RegionLo(6-7)
+///   Subnet1(8-9) Subnet2(10-11) NodeHash(12-13)
+///   SessionID(14-15)
+///
+/// 注意：Service bits 合并到 SessionID 的高位中，通过 flags 区分。
+/// 静态地址：SessionID=0，Service bits 在 Subnet2 的高 4 位。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IPv8Address {
-    pub asn: u32,
-    pub host_id: u32,
-    pub device_id: u16,
-    pub cap_tag: u16,
-    pub sec_level: u8,
-    pub reserved: [u8; 3],
+    /// 协议 Magic (0xFB14)
+    pub protocol: u16,
+    /// 区域 ID 高 16 位
+    pub region_hi: u16,
+    /// 区域 ID 中 16 位
+    pub region_mid: u16,
+    /// 区域 ID 低 16 位 → 总共 48 bit Region
+    pub region_lo: u16,
+    /// 子网 ID 1
+    pub subnet1: u16,
+    /// 子网 ID 2
+    pub subnet2: u16,
+    /// 节点身份哈希（公钥指纹截断）
+    pub node_hash: u16,
+    /// 会话 ID（NAT 穿透用，0=静态地址）
+    pub session_id: u16,
 }
 
+/// 协议 Magic 常量
+pub const PROTOCOL_MAGIC: u16 = 0xFB14;
+
 impl IPv8Address {
-    /// ★ v9：唯一构造入口，reserved 自动填 0。
-    /// 禁止在代码库中直接使用 `IPv8Address { .. }` 字面量初始化，
-    /// 防止漏掉 reserved 填 0 导致协议编解码崩溃。
-    pub fn new(asn: u32, host_id: u32, device_id: u16, cap_tag: u16, sec_level: u8) -> Self {
-        Self { asn, host_id, device_id, cap_tag, sec_level, reserved: [0; 3] }
+    /// 唯一构造入口
+    #[allow(clippy::too_many_arguments)] // 地址 8 字段为协议结构，非设计缺陷
+    pub fn new(
+        protocol: u16,
+        region_hi: u16,
+        region_mid: u16,
+        region_lo: u16,
+        subnet1: u16,
+        subnet2: u16,
+        node_hash: u16,
+        session_id: u16,
+    ) -> Self {
+        Self { protocol, region_hi, region_mid, region_lo, subnet1, subnet2, node_hash, session_id }
+    }
+
+    /// 快捷构造：用 Region u48 + 子网 + 节点哈希
+    pub fn with_region(
+        region: u64,
+        subnet1: u16,
+        subnet2: u16,
+        node_hash: u16,
+        session_id: u16,
+    ) -> Self {
+        Self {
+            protocol: PROTOCOL_MAGIC,
+            region_hi: (region >> 32) as u16,
+            region_mid: (region >> 16) as u16,
+            region_lo: region as u16,
+            subnet1,
+            subnet2,
+            node_hash,
+            session_id,
+        }
+    }
+
+    /// 获取 48 bit Region ID
+    pub fn region(&self) -> u64 {
+        ((self.region_hi as u64) << 32) | ((self.region_mid as u64) << 16) | (self.region_lo as u64)
     }
 
     /// 地址字节数
@@ -67,15 +135,34 @@ impl IPv8Address {
         s
     }
 
+    /// 冒号分隔显示格式（人类可读，类似 IPv6 风格）：
+    /// `fb14:0000:0000:0001:0001:0000:0002:0000`
+    /// 8 组 4 位十六进制，冒号分隔，不压缩零。
+    pub fn to_display_string(&self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let wire = self.to_bytes();
+        let mut s = String::with_capacity(39);
+        for (i, chunk) in wire.chunks(2).enumerate() {
+            if i > 0 {
+                s.push(':');
+            }
+            s.push(HEX[(chunk[0] >> 4) as usize] as char);
+            s.push(HEX[(chunk[0] & 0x0F) as usize] as char);
+            s.push(HEX[(chunk[1] >> 4) as usize] as char);
+            s.push(HEX[(chunk[1] & 0x0F) as usize] as char);
+        }
+        s
+    }
+
     /// 16 字节线格式（大端）
     pub fn to_bytes(&self) -> [u8; 16] {
         let mut b = [0u8; 16];
-        let _ = self.write_to(&mut b); // new() 保证 reserved 全 0
+        self.write_to(&mut b);
         b
     }
 
     /// 解析规范文本形式（protocol-spec §3.2）：32 个十六进制数字，
-    /// 大小写不敏感，无分隔符；Reserved 6 位必须全 0。
+    /// 大小写不敏感，无分隔符。
     pub fn from_canonical_str(s: &str) -> Result<Self, AddrParseError> {
         let bytes = s.as_bytes();
         if bytes.len() != 32 || !bytes.iter().all(|b| b.is_ascii_hexdigit()) {
@@ -85,29 +172,39 @@ impl IPv8Address {
         for i in 0..16 {
             wire[i] = (hex_val(bytes[i * 2]) << 4) | hex_val(bytes[i * 2 + 1]);
         }
-        if wire[13..16] != [0, 0, 0] {
-            return Err(AddrParseError::ReservedNonZero);
-        }
-        Ok(Self::new(
-            u32::from_be_bytes(wire[0..4].try_into().unwrap()),
-            u32::from_be_bytes(wire[4..8].try_into().unwrap()),
-            u16::from_be_bytes(wire[8..10].try_into().unwrap()),
-            u16::from_be_bytes(wire[10..12].try_into().unwrap()),
-            wire[12],
-        ))
+        Self::from_wire(&wire).ok_or(AddrParseError::Format).and_then(|addr| {
+            if addr.protocol != PROTOCOL_MAGIC {
+                Err(AddrParseError::BadProtocol)
+            } else {
+                Ok(addr)
+            }
+        })
     }
 
-    /// 写入 16 字节线格式（大端）。reserved 必须全 0，否则返回 false。
+    /// 从 16 字节线格式解析
+    pub fn from_wire(wire: &[u8; 16]) -> Option<Self> {
+        Some(Self {
+            protocol: u16::from_be_bytes(wire[0..2].try_into().ok()?),
+            region_hi: u16::from_be_bytes(wire[2..4].try_into().ok()?),
+            region_mid: u16::from_be_bytes(wire[4..6].try_into().ok()?),
+            region_lo: u16::from_be_bytes(wire[6..8].try_into().ok()?),
+            subnet1: u16::from_be_bytes(wire[8..10].try_into().ok()?),
+            subnet2: u16::from_be_bytes(wire[10..12].try_into().ok()?),
+            node_hash: u16::from_be_bytes(wire[12..14].try_into().ok()?),
+            session_id: u16::from_be_bytes(wire[14..16].try_into().ok()?),
+        })
+    }
+
+    /// 写入 16 字节线格式（大端）
     pub(crate) fn write_to(&self, buf: &mut [u8]) -> bool {
-        if self.reserved != [0; 3] {
-            return false;
-        }
-        buf[0..4].copy_from_slice(&self.asn.to_be_bytes());
-        buf[4..8].copy_from_slice(&self.host_id.to_be_bytes());
-        buf[8..10].copy_from_slice(&self.device_id.to_be_bytes());
-        buf[10..12].copy_from_slice(&self.cap_tag.to_be_bytes());
-        buf[12] = self.sec_level;
-        buf[13..16].copy_from_slice(&self.reserved);
+        buf[0..2].copy_from_slice(&self.protocol.to_be_bytes());
+        buf[2..4].copy_from_slice(&self.region_hi.to_be_bytes());
+        buf[4..6].copy_from_slice(&self.region_mid.to_be_bytes());
+        buf[6..8].copy_from_slice(&self.region_lo.to_be_bytes());
+        buf[8..10].copy_from_slice(&self.subnet1.to_be_bytes());
+        buf[10..12].copy_from_slice(&self.subnet2.to_be_bytes());
+        buf[12..14].copy_from_slice(&self.node_hash.to_be_bytes());
+        buf[14..16].copy_from_slice(&self.session_id.to_be_bytes());
         true
     }
 }
@@ -299,15 +396,15 @@ impl IPv8Header {
 pub enum AddrParseError {
     /// 长度非 32 或含非十六进制字符
     Format,
-    /// Reserved 6 位非零
-    ReservedNonZero,
+    /// 协议 Magic 不对（不是 0xFB14）
+    BadProtocol,
 }
 
 impl core::fmt::Display for AddrParseError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Format => write!(f, "IPv8+ 地址文本必须是 32 个十六进制数字（无分隔符）"),
-            Self::ReservedNonZero => write!(f, "IPv8+ 地址 Reserved 位必须全 0（spec §2.2）"),
+            Self::BadProtocol => write!(f, "IPv8+ 地址 Protocol Magic 必须是 fb14"),
         }
     }
 }

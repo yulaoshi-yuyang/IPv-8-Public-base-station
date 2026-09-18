@@ -62,8 +62,26 @@ pub unsafe extern "C" fn ipv8_encode(
     let Ok(payload_len_u16): Result<u16, _> = payload_len.try_into() else {
         return Ipv8Buf { data: std::ptr::null_mut(), len: 0 };
     };
-    let src = IPv8Address::new(src_asn, src_host, src_dev, src_cap, src_sec);
-    let dst = IPv8Address::new(dst_asn, dst_host, dst_dev, dst_cap, dst_sec);
+    let src = IPv8Address::new(
+        0xFB14,
+        (src_asn >> 16) as u16,
+        src_asn as u16,
+        (src_host >> 16) as u16,
+        src_host as u16,
+        src_dev,
+        src_cap,
+        (src_sec as u16) << 8,
+    );
+    let dst = IPv8Address::new(
+        0xFB14,
+        (dst_asn >> 16) as u16,
+        dst_asn as u16,
+        (dst_host >> 16) as u16,
+        dst_host as u16,
+        dst_dev,
+        dst_cap,
+        (dst_sec as u16) << 8,
+    );
     let mut hdr = IPv8Header::new(src, dst, payload_len_u16);
     hdr.flags = flags;
     hdr.hop_limit = hop_limit;
@@ -94,16 +112,16 @@ pub unsafe extern "C" fn ipv8_decode(buf: *const u8, len: c_uint, out: *mut Ipv8
         Ok(d) => {
             unsafe {
                 *out = Ipv8Decoded {
-                    src_asn: d.header.src_addr.asn,
-                    src_host: d.header.src_addr.host_id,
-                    src_dev: d.header.src_addr.device_id,
-                    src_cap: d.header.src_addr.cap_tag,
-                    src_sec: d.header.src_addr.sec_level,
-                    dst_asn: d.header.dst_addr.asn,
-                    dst_host: d.header.dst_addr.host_id,
-                    dst_dev: d.header.dst_addr.device_id,
-                    dst_cap: d.header.dst_addr.cap_tag,
-                    dst_sec: d.header.dst_addr.sec_level,
+                    src_asn: ((d.header.src_addr.region_hi as u32) << 16) | d.header.src_addr.region_mid as u32,
+                    src_host: ((d.header.src_addr.region_lo as u32) << 16) | d.header.src_addr.subnet1 as u32,
+                    src_dev: d.header.src_addr.subnet2,
+                    src_cap: d.header.src_addr.node_hash,
+                    src_sec: (d.header.src_addr.session_id >> 8) as u8,
+                    dst_asn: ((d.header.dst_addr.region_hi as u32) << 16) | d.header.dst_addr.region_mid as u32,
+                    dst_host: ((d.header.dst_addr.region_lo as u32) << 16) | d.header.dst_addr.subnet1 as u32,
+                    dst_dev: d.header.dst_addr.subnet2,
+                    dst_cap: d.header.dst_addr.node_hash,
+                    dst_sec: (d.header.dst_addr.session_id >> 8) as u8,
                     flags: d.header.flags,
                     payload_len: d.header.payload_len,
                     hop_limit: d.header.hop_limit,

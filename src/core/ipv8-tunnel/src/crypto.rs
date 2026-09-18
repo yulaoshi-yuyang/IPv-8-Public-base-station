@@ -56,6 +56,11 @@ impl CipherSuite {
 
 /// 当前 epoch 派生出的活动密码器（enum dispatch，避免 dyn）。
 /// AES-GCM 内部结构远大于 ChaCha，装箱压平 enum 尺寸（clippy::large_enum_variant）。
+///
+/// Phase 2：TunnelKeys 按 epoch 缓存 Cipher，同代内 seal/open 零 HKDF——
+/// 两种底层 AEAD 均为 Clone（密钥材料可复制），derive_shard 克隆 SA 时
+/// 缓存随之复制，无需重建。
+#[derive(Clone)]
 enum Cipher {
     ChaCha(ChaCha20Poly1305),
     Aes(Box<aes_gcm::Aes256Gcm>),
@@ -194,6 +199,12 @@ pub struct TunnelKeys {
     stride: u64,
     /// 各 epoch 的接收滑动窗口（仅保留最近 GRACE_EPOCHS+1 代）
     rx: BTreeMap<u64, RxWindow>,
+    /// Phase 2：发送侧 Cipher 缓存（(epoch, cipher)）。HKDF（2 次 HMAC-SHA256）
+    /// 只在轮换后首包执行一次；advance_epoch/rekey/set_suite 时失效。
+    send_cipher: Option<(u64, Cipher)>,
+    /// Phase 2：接收侧按 epoch 的 Cipher 缓存，与 rx 窗口同 prune 生命周期
+    /// （宽限一代内的迟到帧免重派生，更旧代随窗口一起淘汰）。
+    rx_ciphers: BTreeMap<u64, Cipher>,
 }
 
 /// 接收重放窗口（IPsec 式）：`top` = 已接受的最大计数器，`mask` 第 k 位
@@ -253,6 +264,8 @@ impl Clone for TunnelKeys {
             shard: self.shard,
             stride: self.stride,
             rx: self.rx.clone(),
+            send_cipher: self.send_cipher.clone(),
+            rx_ciphers: self.rx_ciphers.clone(),
         }
     }
 }
@@ -271,6 +284,8 @@ impl TunnelKeys {
             shard: 0,
             stride: 1,
             rx: BTreeMap::new(),
+            send_cipher: None,
+            rx_ciphers: BTreeMap::new(),
         }
     }
 
@@ -318,6 +333,10 @@ impl TunnelKeys {
         k.epoch_bytes = 0;
         k.tx_counter = 0;
         k.rx = BTreeMap::new();
+        // 派生的是全新同余 SA：父 SA 缓存的 cipher 属于父 epoch/计数器链，
+        // 首包按本分片首代重新派生（HKDF 域分离 epoch 不同，本就不可复用）。
+        k.send_cipher = None;
+        k.rx_ciphers = BTreeMap::new();
         k
     }
 
@@ -336,6 +355,9 @@ impl TunnelKeys {
             return false;
         }
         self.suite = suite;
+        // 套件变更 → HKDF info 域分离变化，任何旧派生缓存一律作废
+        self.send_cipher = None;
+        self.rx_ciphers.clear();
         true
     }
 
@@ -362,7 +384,15 @@ impl TunnelKeys {
             self.advance_epoch();
         }
         self.tx_counter += 1;
-        let cipher = cipher_for(&self.dh, self.suite, self.send_epoch, self.is_initiator, true);
+        // Phase 2：同 epoch 复用 Cipher，HKDF（2×HMAC-SHA256）每代只做一次
+        let epoch = self.send_epoch;
+        if !matches!(&self.send_cipher, Some((e, _)) if *e == epoch) {
+            self.send_cipher = Some((
+                epoch,
+                cipher_for(&self.dh, self.suite, epoch, self.is_initiator, true),
+            ));
+        }
+        let cipher = &self.send_cipher.as_ref().expect("上方刚填充").1;
         let ct = cipher
             .encrypt(&nonce_for(self.tx_counter), Payload { msg: plaintext, aad })
             .expect("AEAD encrypt cannot fail for inbounds size");
@@ -407,7 +437,12 @@ impl TunnelKeys {
             return Err(FrameError::StaleEpoch { epoch, newest });
         }
 
-        let cipher = cipher_for(&self.dh, self.suite, epoch, self.is_initiator, false);
+        // Phase 2：宽限代内的 Cipher 缓存复用（每代每个 SA 只 HKDF 一次）
+        if !self.rx_ciphers.contains_key(&epoch) {
+            let c = cipher_for(&self.dh, self.suite, epoch, self.is_initiator, false);
+            self.rx_ciphers.insert(epoch, c);
+        }
+        let cipher = self.rx_ciphers.get(&epoch).expect("上方刚插入");
         let win = self.rx.entry(epoch).or_default();
         // 先验密码学完整性，通过才占重放位（篡改包不得污染窗口）
         match cipher.decrypt(&nonce_for(counter), Payload { msg: ct, aad }) {
@@ -428,12 +463,17 @@ impl TunnelKeys {
         self.dh = new_dh;
         self.advance_epoch();
         self.rx.clear();
+        // 新 DH → 全部旧接收派生失效（advance_epoch 已清发送侧缓存）
+        self.rx_ciphers.clear();
     }
 
     fn prune(&mut self, newest: u64) {
         let floor = newest.saturating_sub(GRACE_EPOCHS.saturating_mul(self.stride));
         let keep = self.rx.split_off(&floor);
         self.rx = keep;
+        // Cipher 缓存与重放窗同生命周期：保留 >= floor 的代，其余随窗淘汰
+        let keep_ciphers = self.rx_ciphers.split_off(&floor);
+        self.rx_ciphers = keep_ciphers;
     }
 
     fn advance_epoch(&mut self) {
@@ -442,6 +482,8 @@ impl TunnelKeys {
         self.epoch_created = Instant::now();
         self.epoch_bytes = 0;
         self.tx_counter = 0;
+        // 新代 Cipher 由下一次 seal 懒派生（同代内继续命中缓存）
+        self.send_cipher = None;
     }
 }
 
@@ -593,6 +635,73 @@ mod tests {
             out
         };
         assert_eq!(b.open(&late_kid, &late_body, AAD).unwrap(), b"late");
+    }
+
+    /// Phase 2: Cipher cache -- same epoch hits, rotation rebuilds,
+    /// grace epochs coexist, prune follows replay window lifecycle.
+    #[test]
+    fn cipher_cache_hits_rotates_and_prunes() {
+        let (mut a, mut b) = pair();
+        for i in 0..3u8 {
+            let (kid, body) = a.seal(AAD, &[i]);
+            assert_eq!(b.open(&kid, &body, AAD).unwrap(), vec![i]);
+        }
+        assert!(matches!(a.send_cipher, Some((0, _))));
+        assert!(b.rx_ciphers.contains_key(&0));
+
+        // Rotation: first frame of epoch 1 rebuilds send cache.
+        a.epoch_bytes = ROTATE_BYTES;
+        let (k1, b1) = a.seal(AAD, b"e1");
+        assert_eq!(a.current_epoch(), 1);
+        assert!(matches!(a.send_cipher, Some((1, _))));
+        assert_eq!(b.open(&k1, &b1, AAD).unwrap(), b"e1");
+        // Late frame of the grace epoch still opens -> rx caches 0 and 1 coexist.
+        let (late_k, late_b) = {
+            let keep = (a.send_epoch, a.tx_counter);
+            a.send_epoch = 0;
+            a.tx_counter = 9; // 未使用计数器（epoch 0 已收 1..=3），仍在重放窗内
+            let out = a.seal(AAD, b"late");
+            a.send_epoch = keep.0;
+            a.tx_counter = keep.1;
+            out
+        };
+        assert_eq!(b.open(&late_k, &late_b, AAD).unwrap(), b"late");
+        assert!(b.rx_ciphers.contains_key(&0));
+        assert!(b.rx_ciphers.contains_key(&1));
+
+        // Epoch 2 arrives -> floor=1: epoch 0 window and cipher cache pruned together.
+        let (k2, b2) = {
+            let keep = (a.send_epoch, a.tx_counter);
+            a.send_epoch = 2;
+            a.tx_counter = 0;
+            a.epoch_bytes = 0;
+            let out = a.seal(AAD, b"e2");
+            a.send_epoch = keep.0;
+            a.tx_counter = keep.1;
+            out
+        };
+        assert_eq!(b.open(&k2, &b2, AAD).unwrap(), b"e2");
+        assert!(!b.rx_ciphers.contains_key(&0), "stale cipher pruned with window");
+        assert!(b.rx_ciphers.contains_key(&1));
+        assert!(b.rx_ciphers.contains_key(&2));
+        assert!(!b.rx.contains_key(&0), "window and cache share lifecycle");
+    }
+
+    /// Phase 2: suite switch before first frame -> caches derive from new suite;
+    /// after first frame the switch is rejected and the cache chain stays.
+    #[test]
+    fn set_suite_rebuilds_cipher_cache() {
+        let (mut a, mut b) = pair();
+        assert!(a.set_suite(CipherSuite::Aes256Gcm));
+        assert!(b.set_suite(CipherSuite::Aes256Gcm));
+        let (kid, body) = a.seal(AAD, b"aes");
+        assert_eq!(kid[0], CipherSuite::Aes256Gcm.byte());
+        assert_eq!(b.open(&kid, &body, AAD).unwrap(), b"aes");
+        assert!(matches!(a.send_cipher, Some((0, Cipher::Aes(_)))));
+        assert!(matches!(b.rx_ciphers.get(&0), Some(Cipher::Aes(_))));
+
+        assert!(!a.set_suite(CipherSuite::ChaCha20Poly1305));
+        assert!(matches!(a.send_cipher, Some((0, Cipher::Aes(_)))));
     }
 
     #[test]

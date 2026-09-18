@@ -23,7 +23,7 @@ mod tests {
     use ipv8_codec::{encode, ExtType, ExtensionHeader, IPv8Address, IPv8Header, QosReservation, flags};
 
     fn hdr_with_level(level: u16) -> Vec<u8> {
-        let a = IPv8Address::new(1, 2, 1, 0, 1);
+        let a = IPv8Address::with_region(1, 2, 1, 0, 1);
         let mut h = IPv8Header::new(a, a, 4);
         h.flags = level | flags::ENCRYPTED;
         encode(&h, b"dat!").unwrap()

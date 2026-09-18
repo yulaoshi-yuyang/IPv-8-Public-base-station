@@ -11,11 +11,24 @@ path = "src/main.rs"
 
 [dependencies]
 ipv8-codec = { workspace = true }
+ipv8-compat = { workspace = true }
+ipv8-fec = { path = "../../core/ipv8-fec" }
+ipv8-hook = { path = "../../core/ipv8-hook" }
 ipv8-tunnel = { path = "../../core/ipv8-tunnel" }
 ipv8-grpc = { path = "../../core/ipv8-grpc" }
 ipv8-zoneserver = { path = "../../cloud/zoneserver" }
 ipv8-resolver = { path = "../../cloud/resolver" }
 wintun = "0.5.1"
+# Phase 2 RIO 数据面：仅用 Winsock/Foundation/Threading FFI
+# （0.52 已在 lock 中，随 wintun 传递引入；CreateEventW/Sleep/
+# WaitForMultipleObjects/INFINITE 在 0.52 里归 Win32_System_Threading）
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_System_Threading",
+] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
 tokio-stream = "0.1"
 tonic = { version = "0.12", features = ["transport"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

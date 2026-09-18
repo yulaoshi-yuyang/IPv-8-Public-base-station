@@ -1,0 +1,26 @@
+[package]
+name = "ipv8-client"
+description = "IPv8+ 客户端工具：ping8（普通用户）+ ipv8adm（高级管理）"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ping8"
+path = "src/main.rs"
+
+[[bin]]
+name = "ipv8adm"
+path = "src/main.rs"
+
+[dependencies]
+ipv8-codec = { workspace = true }
+ipv8-firewall = { path = "../../core/ipv8-firewall" }
+ipv8-neigh = { path = "../../core/ipv8-neigh" }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+rand_core = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]

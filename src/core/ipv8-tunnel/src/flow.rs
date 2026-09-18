@@ -364,13 +364,13 @@ mod tests {
     fn engine_pair() -> (Engine, Engine) {
         let alice = Engine::new(
             Identity::from_bytes([1u8; 32]),
-            IPv8Address::new(1, 1, 0, 0, 0),
-            IPv8Address::new(1, 2, 0, 0, 0),
+            IPv8Address::with_region(1, 0, 0, 0, 0),
+            IPv8Address::with_region(2, 0, 0, 0, 0),
         );
         let bob = Engine::new(
             Identity::from_bytes([2u8; 32]),
-            IPv8Address::new(1, 2, 0, 0, 0),
-            IPv8Address::new(1, 1, 0, 0, 0),
+            IPv8Address::with_region(2, 0, 0, 0, 0),
+            IPv8Address::with_region(1, 0, 0, 0, 0),
         );
         (alice, bob)
     }

@@ -9,8 +9,8 @@ $log = Join-Path $env:TEMP 'ipv8-punch-smoke'
 New-Item -ItemType Directory -Force -Path $log | Out-Null
 Remove-Item (Join-Path $log '*.log') -ErrorAction SilentlyContinue
 
-$addrA = '0000fb140000000a0001000001000000'
-$addrB = '0000fb140000000b0001000001000000'
+$addrA = 'fb140000000a00010000010000000000'
+$addrB = 'fb140000000b00010000010000000000'
 
 # 1) resolver
 $pz = Start-Process $zexe -ArgumentList @('--addr','127.0.0.1:7080') -PassThru -WindowStyle Hidden `

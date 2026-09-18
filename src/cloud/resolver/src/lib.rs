@@ -15,12 +15,18 @@
 //! 条件后置，不进本轮验收。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use smallvec::SmallVec;
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use ipv8_codec::IPv8Address;
 
 pub mod grpc;
+pub mod sqlite_store;
+pub mod dht_store;
+pub mod cached_store;
 
 /// 登记记录（一个 IPv8+ 地址的可达性事实）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +34,8 @@ pub struct NodeRecord {
     /// 主隧道入口 "ip:port"
     pub tunnel_entry: String,
     /// 备用入口列表（Fallback 的级联候选，v9 alt_ips 语义）
-    pub alt_entries: Vec<String>,
+    /// SmallVec：90%+ 节点为空 → 栈上零分配，clone 0ns vs Vec ~40ns
+    pub alt_entries: SmallVec<[String; 4]>,
     /// 是否支持 IPv8+（否则查询方直接降级——v9 ipv8_capable 源头）
     pub ipv8_capable: bool,
     /// 建议 MTU（0 = 未声明，响应时填协议默认）
@@ -42,7 +49,7 @@ pub struct NodeRecord {
     pub observed: Option<(String, Instant)>,
     /// ADR-026：节点在 Rendezvous 时自报的候选（LAN 地址等，仅信息性——
     /// 自报可能伪冒，权威候选是 observed；数量/长度在入口处消毒）。
-    pub local_candidates: Vec<String>,
+    pub local_candidates: SmallVec<[String; 4]>,
 }
 
 impl NodeRecord {
@@ -83,6 +90,9 @@ pub struct Entry {
     pub ed_pub: [u8; 32],
     pub rec: NodeRecord,
 }
+
+/// 共享指针包装的 Entry（Store::get 返回类型，Arc clone ~5ns）
+pub type ArcEntry = Arc<Entry>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
@@ -138,7 +148,7 @@ pub fn rendezvous_pop_message(addr_text: &str, peer_text: &str) -> Vec<u8> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
     pub tunnel_entry: String,
-    pub alt_entries: Vec<String>,
+    pub alt_entries: SmallVec<[String; 4]>,
     pub ipv8_capable: bool,
     pub mtu: u32,
     pub ttl: Duration,
@@ -163,7 +173,7 @@ fn add_secs(base: Instant, d: Duration) -> Instant {
 
 /// 自报候选消毒：条数截断、长度截断、仅保留可见 ASCII——
 /// 这些串最终会出现在对端进程的解析输出里，入口必须收紧。
-fn sanitize_candidates(list: &[String]) -> Vec<String> {
+fn sanitize_candidates(list: &[String]) -> SmallVec<[String; 4]> {
     list.iter()
         .take(MAX_LOCAL_CANDIDATES)
         .filter_map(|s| {
@@ -173,9 +183,15 @@ fn sanitize_candidates(list: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// 内存版存储（ADR-010：trait 先行、实现按触发条件后置）。
-pub trait Store: Default {
-    fn get(&self, addr: &IPv8Address) -> Option<&Entry>;
+/// 存储抽象（ADR-010：trait 先行、实现按触发条件后置）。
+/// 注意：故意不加 `Default` supertrait——SQLite/DHT 等实现
+/// 需要路径/网络参数才能构造，走 `with_store` 入口即可。
+///
+/// `get` 返回 `Arc<Entry>`：缓存命中时 Arc clone 仅 ~5ns
+/// （原子引用计数 +1），避免 Entry 深拷贝的 ~200ns 开销。
+/// 写入仍按值接受 Entry，各实现内部自行包装 Arc。
+pub trait Store {
+    fn get(&self, addr: &IPv8Address) -> Option<Arc<Entry>>;
     fn insert(&mut self, addr: IPv8Address, e: Entry);
     /// 返回清理条数
     fn sweep_expired(&mut self, now: Instant) -> usize;
@@ -188,15 +204,15 @@ pub trait Store: Default {
 /// 默认存储：单 zone 内存表（自托管单机形态）
 #[derive(Default)]
 pub struct MemStore {
-    by_addr: HashMap<IPv8Address, Entry>,
+    by_addr: HashMap<IPv8Address, Arc<Entry>>,
 }
 
 impl Store for MemStore {
-    fn get(&self, addr: &IPv8Address) -> Option<&Entry> {
-        self.by_addr.get(addr)
+    fn get(&self, addr: &IPv8Address) -> Option<Arc<Entry>> {
+        self.by_addr.get(addr).cloned()
     }
     fn insert(&mut self, addr: IPv8Address, e: Entry) {
-        self.by_addr.insert(addr, e);
+        self.by_addr.insert(addr, Arc::new(e));
     }
     fn sweep_expired(&mut self, now: Instant) -> usize {
         let before = self.by_addr.len();
@@ -241,21 +257,21 @@ pub struct ResolverService<S: Store = MemStore> {
     store: S,
 }
 
-impl<S: Store> Default for ResolverService<S> {
+impl Default for ResolverService<MemStore> {
     fn default() -> Self {
-        Self { store: S::default() }
+        Self::new()
     }
 }
 
 impl ResolverService<MemStore> {
-    /// 默认内存存储构造
+    /// 默认内存存储构造（重启丢失；自测 / 无持久化部署用）
     pub fn new() -> Self {
         Self { store: MemStore::default() }
     }
 }
 
 impl<S: Store> ResolverService<S> {
-    /// 自定义存储构造（将来 SQLite/PG 后端入口，ADR-010）
+    /// 自定义存储构造（SQLite/PG 等持久化后端入口，ADR-010）
     pub fn with_store(store: S) -> Self {
         Self { store }
     }
@@ -277,7 +293,7 @@ impl<S: Store> ResolverService<S> {
         pk.copy_from_slice(spec.ed_pub);
         let vk = VerifyingKey::from_bytes(&pk).map_err(|_| ResolveError::BadProof)?;
 
-        let existing = self.store.get(&addr).cloned();
+        let existing = self.store.get(&addr);
         match existing.as_ref() {
             Some(e) if e.ed_pub == pk => { /* 重登记：持有者已证，免 PoP */ }
             Some(e) if e.rec.is_expired(now) => {
@@ -303,9 +319,9 @@ impl<S: Store> ResolverService<S> {
         // （None，如测试直调/代理终结连接）时，**同身份**重登记保留旧值，
         // **新身份**接管则清空（旧映射属于上一个持有者，不能继承）。
         let (observed, local_candidates) = match (spec.observed, existing.as_ref()) {
-            (Some(o), _) => (Some((o.to_string(), now)), Vec::new()),
+            (Some(o), _) => (Some((o.to_string(), now)), SmallVec::new()),
             (None, Some(e)) if e.ed_pub == pk => (e.rec.observed.clone(), e.rec.local_candidates.clone()),
-            (None, _) => (None, Vec::new()),
+            (None, _) => (None, SmallVec::new()),
         };
         self.store.insert(
             addr,
@@ -313,7 +329,7 @@ impl<S: Store> ResolverService<S> {
                 ed_pub: pk,
                 rec: NodeRecord {
                     tunnel_entry: spec.tunnel_entry.to_string(),
-                    alt_entries: spec.alt_entries.clone(),
+                    alt_entries: spec.alt_entries.clone().into(),
                     ipv8_capable: spec.ipv8_capable,
                     mtu: spec.mtu,
                     registered_at: now,
@@ -381,7 +397,7 @@ impl<S: Store> ResolverService<S> {
         let peer = IPv8Address::from_canonical_str(peer_text).map_err(|_| ResolveError::BadAddress)?;
 
         // 1) 本端身份：已登记 + PoP 用存储公钥验（不采信请求里的任何公钥）
-        let me = self.store.get(&addr).cloned().ok_or(ResolveError::NotFound)?;
+        let me = self.store.get(&addr).ok_or(ResolveError::NotFound)?;
         if me.rec.is_expired(now) {
             return Err(ResolveError::NotFound);
         }
@@ -461,7 +477,7 @@ mod tests {
     use ed25519_dalek::Signer;
 
     fn text(n: u32) -> String {
-        IPv8Address::new(64500, n, 1, 0, 1).to_canonical_string()
+        IPv8Address::with_region(n as u64, 1, 0, 0x0100, 0).to_canonical_string()
     }
 
     struct Node {
@@ -564,7 +580,7 @@ mod tests {
         full(&mut s, &t, &n, &[], "10.0.0.9:9999", vec!["10.0.0.8:8".into()], true, 1400, 600, Instant::now()).unwrap();
         let r = s.resolve(&t, Instant::now()).unwrap();
         assert_eq!(r.tunnel_entry, "10.0.0.9:9999");
-        assert_eq!(r.alt_entries, vec!["10.0.0.8:8".to_string()]);
+        assert_eq!(r.alt_entries.to_vec(), vec!["10.0.0.8:8".to_string()]);
         assert_eq!(r.mtu, 1400);
         assert_eq!(r.ttl, Duration::from_secs(600));
     }

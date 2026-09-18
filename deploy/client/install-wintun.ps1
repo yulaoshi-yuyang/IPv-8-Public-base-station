@@ -1,4 +1,4 @@
-# deploy/client/install-wintun.ps1
+﻿# deploy/client/install-wintun.ps1
 # wintun 安装 + MTU 设置（v9：MTU 1432 在此钉死，防 OS 发 1500 包超隧道开销）
 #Requires -RunAsAdministrator
 

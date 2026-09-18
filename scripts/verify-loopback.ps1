@@ -88,8 +88,8 @@ $root  = Split-Path $PSScriptRoot -Parent
 $exe   = Join-Path $root 'target\release\ipv8-node.exe'
 $zexe  = Join-Path $root 'target\release\ipv8-zoneserver.exe'
 $dll   = Join-Path $root 'deploy\client\wintun.dll'
-$addrA = '0000fb140000000a0001000001000000'   # ASN 64500 / host 10 / dev 1 / sec 1
-$addrB = '0000fb140000000b0001000001000000'   # ASN 64500 / host 11 / dev 1 / sec 1
+$addrA = 'fb140000000a00010000010000000000'   # ASN 64500 / host 10 / dev 1 / sec 1
+$addrB = 'fb140000000b00010000010000000000'   # ASN 64500 / host 11 / dev 1 / sec 1
 $dstViaA = '10.100.0.32'
 $dstViaB = '10.100.0.33'
 

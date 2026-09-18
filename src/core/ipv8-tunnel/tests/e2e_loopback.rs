@@ -6,7 +6,7 @@ use ipv8_codec::IPv8Address;
 use ipv8_tunnel::{Engine, State, TunWorker, mock_tun};
 
 fn addr(n: u32) -> IPv8Address {
-    IPv8Address::new(64500, n, 1, 0, 1)
+    IPv8Address::with_region(n as u64, 1, 0, 1, 0)
 }
 
 #[test]

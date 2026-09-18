@@ -1,0 +1,7 @@
+tunnel: d514d325-05f8-4564-9180-c08fc3861d27
+credentials-file: C:\Users\19175\.cloudflared\d514d325-05f8-4564-9180-c08fc3861d27.json
+
+ingress:
+  - hostname: ipv8.yulaoshi.xyz
+    service: http://127.0.0.1:9001
+  - service: http_status:404

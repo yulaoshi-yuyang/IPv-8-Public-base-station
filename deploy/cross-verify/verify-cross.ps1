@@ -151,8 +151,8 @@ if ((Test-Path $_repoRel) -and (Test-Path $exe)) {
 }
 
 # Identity plan (same ASN/64500 family as loopback; host octet = role)
-$addrSelf = if ($Role -eq 'A') { '0000fb140000000a0001000001000000' } else { '0000fb140000000b0001000001000000' }
-$addrPeer = if ($Role -eq 'A') { '0000fb140000000b0001000001000000' } else { '0000fb140000000a0001000001000000' }
+$addrSelf = if ($Role -eq 'A') { 'fb140000000a00010000010000000000' } else { 'fb140000000b00010000010000000000' }
+$addrPeer = if ($Role -eq 'A') { 'fb140000000b00010000010000000000' } else { 'fb140000000a00010000010000000000' }
 $tunSelf  = if ($Role -eq 'A') { '100.64.0.1' } else { '100.64.0.2' }
 $tunPeer  = if ($Role -eq 'A') { '100.64.0.2' } else { '100.64.0.1' }
 $edSeed   = if ($Role -eq 'A') { 'A1' * 32 } else { 'B0' * 32 }
@@ -259,7 +259,10 @@ try {
 
     $argList = @('--self', $addrSelf, '--peer-addr', $addrPeer, '--peer-ip', $PeerIp,
                  '--tun-ip', $tunSelf, '--udp-port', "$UdpPort", '--peer-port', "$UdpPort",
-                 '--adapter-name', 'IPv8Plus')
+                 '--adapter-name', 'IPv8Plus',
+                 # RIO Auto 在部分 Win11 24H2/25H2 上 create() 静默挂起（无任何输出），
+                 # 跨机验证不依赖该性能线，强制标准 UDP 数据面保功能。
+                 '--rio', 'off')
     if ($Role -eq 'A') { $argList += '--initiate' }
     # LearnPeer rides on the PASSIVE responder: it learns the intranet peer's
     # real post-NAT entry from the first valid frame and replies there.

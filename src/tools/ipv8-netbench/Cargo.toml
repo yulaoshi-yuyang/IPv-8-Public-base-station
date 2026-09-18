@@ -1,0 +1,11 @@
+[package]
+name = "ipv8-netbench"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ipv8-netbench"
+path = "src/main.rs"
+
+[dependencies]

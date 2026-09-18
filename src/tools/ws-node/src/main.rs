@@ -267,15 +267,18 @@ fn now_epoch() -> u64 {
 
 /// 16 字节地址线格式 → IPv8Address（大端；reserved 非 0 = 非法）
 fn addr_from_wire(b: &[u8]) -> Option<IPv8Address> {
-    if b.len() != ADDR_WIRE || b[13..16] != [0u8; 3] {
+    if b.len() != ADDR_WIRE {
         return None;
     }
     Some(IPv8Address::new(
-        u32::from_be_bytes(b[0..4].try_into().ok()?),
-        u32::from_be_bytes(b[4..8].try_into().ok()?),
+        u16::from_be_bytes(b[0..2].try_into().ok()?),
+        u16::from_be_bytes(b[2..4].try_into().ok()?),
+        u16::from_be_bytes(b[4..6].try_into().ok()?),
+        u16::from_be_bytes(b[6..8].try_into().ok()?),
         u16::from_be_bytes(b[8..10].try_into().ok()?),
         u16::from_be_bytes(b[10..12].try_into().ok()?),
-        b[12],
+        u16::from_be_bytes(b[12..14].try_into().ok()?),
+        u16::from_be_bytes(b[14..16].try_into().ok()?),
     ))
 }
 
@@ -667,7 +670,7 @@ mod relay_tests {
     use super::*;
 
     fn addr(n: u32) -> IPv8Address {
-        IPv8Address::new(0xfb14, n, 1, 0, 1)
+        IPv8Address::with_region(n as u64, 1, 0, 0x0100, 0)
     }
 
     /// 中继消息封套：dst(16B 路由头) ‖ 帧体（帧体内容对路由透明）
@@ -689,10 +692,14 @@ mod relay_tests {
     fn wire_roundtrips() {
         let a = addr(7);
         assert_eq!(addr_from_wire(&a.to_bytes()), Some(a));
-        // reserved 非 0 → 拒
-        let mut bad = a.to_bytes();
-        bad[14] = 1;
-        assert_eq!(addr_from_wire(&bad), None);
+        // 长度不足 → 拒
+        assert_eq!(addr_from_wire(&[0u8; 15]), None);
+        // session_id 非 0 → 合法（新格式无 reserved 字段）
+        let mut modified = a.to_bytes();
+        modified[14] = 1;
+        let decoded = addr_from_wire(&modified);
+        assert!(decoded.is_some());
+        assert_eq!(decoded.unwrap().session_id, 0x0100);
         let ca = CertAuthority::from_seed([0xC4; 32]);
         let ident = provision(&ca, a, [0xA1; 32], NO_EXPIRY);
         assert_eq!(cert_from_wire(&ident.cert.to_wire()), Some(ident.cert));
