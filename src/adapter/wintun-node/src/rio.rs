@@ -1141,8 +1141,9 @@ impl SlotTable {
     }
 
     fn free(&self, slot: usize) {
-        // 仅允许释放「占用中」的槽；debug 下抓双重回收。
-        debug_assert!(self.used[slot].swap(false, Ordering::AcqRel));
+        // 总是释放；debug 下额外抓双重回收（swap 返回之前的值=是否曾占用）。
+        let was_used = self.used[slot].swap(false, Ordering::AcqRel);
+        debug_assert!(was_used, "双重回收槽位 {slot}");
     }
 }
 

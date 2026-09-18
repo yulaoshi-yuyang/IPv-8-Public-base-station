@@ -3836,7 +3836,7 @@ fn cmd_neigh_hello(args: &[String]) {
     let hello = proc.build_hello(nonce, now);
 
     // 选择传输层（--bind 仅 UDP 模式生效）
-    let mut transport = match select_transport(force.as_deref(), bind_ip) {
+    let mut transport = match select_transport(force, bind_ip) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("传输层选择失败: {e}");
@@ -3933,7 +3933,7 @@ fn cmd_neigh_watch(args: &[String]) {
         neigh::NeighborProcessor::new(DalekNeighborSigner(sk), addr, pk, store);
 
     // 选择传输层（watch 固定监听全部网卡，不接受 --bind）
-    let mut transport = match select_transport(force.as_deref(), None) {
+    let mut transport = match select_transport(force, None) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("传输层选择失败: {e}");

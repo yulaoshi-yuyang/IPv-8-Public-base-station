@@ -327,6 +327,9 @@ struct Config {
     nt_size: usize,
     tun_ip: Ipv4Addr,
     netmask: Ipv4Addr, // 默认 /10 = CGNAT 空间（spec §7.9 / ADR-015）
+    /// TUN IPv6 地址（方案 A：ULA 段，如 fd14::1/64）。None = 不给 TUN 配 v6，
+    /// v6 流量走物理网卡不进隧道（与现有 v4 零回归对称）。
+    tun_ipv6: Option<Ipv6Addr>,
     udp_port: u16,
     peer_port: u16,
     /// 备用隧道入口（--alt-ip/--alt-port）：主入口握手失败后 FallbackManager 级联至此。
