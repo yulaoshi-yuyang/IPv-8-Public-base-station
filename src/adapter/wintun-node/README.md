@@ -8,8 +8,9 @@ IPv8+ 用户侧节点守护：wintun 虚拟网卡 ↔ 隧道引擎 ↔ UDP 外�
 二进制 `ipv8-node.exe`。关键开关：`--no-tun`（零驱动/不提权）、`--dll`（覆盖 dll 路径）。
 排查口诀：全部能力默认关；怪网络问题先去开关跑零回归基线，再逐个加回二分定位。
 - `--rio auto`：被安全软件拦截（10045）自动回退 std 并具名提示
-- `--mp`：双路径竞速，接收端防重放去重；单路全损不丢数据（另一路完整送达），代价是持续双发带宽
-- `--fec`：仅 DSCP≠0 流；两端不一致时退化为不纠错——对端静默丢弃恢复帧（Type=6），数据帧照常收
+- `--mp`：双路径竞速，接收端防重放去重；单路全损不丢数据（另一路完整送达），代价是持续双发带宽。ADR-0002 观测熔断：alt 持续死透自动停发、恢复后自动回双发（main 同死不熔断）
+- `--fec`：冗余由观测门控自动启停（对端方向 union 丢包率滞回判决，初始关）；两端不一致时退化为不纠错——对端静默丢弃恢复帧（Type=6），数据帧照常收
+- 观测底座（ADR-0002，装配即启用）：200ms 回执帧（Type=7）驱动 --mp 熔断与 --fec 门控，无需开关
 
 ## 内部文件
 - `main.rs` — 参数解析、装配与主循环
@@ -17,5 +18,5 @@ IPv8+ 用户侧节点守护：wintun 虚拟网卡 ↔ 隧道引擎 ↔ UDP 外�
 - `rio.rs` — Registered I/O UDP 收发
 
 ## import 白名单
-- workspace 内：ipv8-codec / compat / fec / hook / tunnel / grpc / zoneserver / resolver
+- workspace 内：ipv8-codec / compat / fec / observe / hook / tunnel / grpc / zoneserver / resolver
 - 外部：wintun 0.5、windows-sys 0.52、tokio 1、tokio-stream 0.1、tonic 0.12、sha2、tracing

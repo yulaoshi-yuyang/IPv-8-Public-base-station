@@ -724,6 +724,29 @@ impl Engine {
         Ok(out)
     }
 
+    /// ADR-0002：把观测回执载荷密封为 Type=7 完整帧（与 Data 独立的 nonce
+    /// 空间，见 [`TunnelKeys::seal_receipt`]）。未建链返回 None。
+    pub fn seal_receipt(&mut self, report: &[u8]) -> Option<Vec<u8>> {
+        let keys = self.keys.as_mut()?;
+        let (key_id, body) = keys.seal_receipt(report);
+        let mut frame = Vec::with_capacity(FRAME_HEADER_SIZE + body.len());
+        write_head(&mut frame, FrameType::Receipt, &key_id);
+        frame.extend_from_slice(&body);
+        Some(frame)
+    }
+
+    /// ADR-0002：开壳 Type=7 回执帧，返回明文报告载荷。非 Receipt 类型、
+    /// 未建链或任何 AEAD/重放失败均返回 None（node 层静默 debug 即可）。
+    pub fn open_receipt(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+        let head = parse_head(frame).ok()?;
+        if head.frame_type != FrameType::Receipt {
+            return None;
+        }
+        let keys = self.keys.as_mut()?;
+        keys.open_receipt(&head.key_id, &frame[FRAME_HEADER_SIZE..])
+            .ok()
+    }
+
     /// 状态快照（gRPC TunnelStatus 映射
     pub fn stats(&self) -> EngineStats {
         EngineStats {

@@ -181,6 +181,17 @@ fn nonce_for(counter: u64) -> AeadNonce {
     AeadNonce::clone_from_slice(&n)
 }
 
+/// ADR-0002 回执帧 nonce：计数器空间与 Data 不相交——n[4] 最高位置 1。
+/// Data nonce 的 n[4] 仅在计数器 ≥2^56 时才可能非零，轮换阈值下永不到达；
+/// 故两空间构造性不相交，同密钥无重用。
+const RECEIPT_NONCE_BIT: u8 = 0x80;
+
+fn receipt_nonce(counter: u64) -> AeadNonce {
+    let mut n = nonce_for(counter);
+    n[4] |= RECEIPT_NONCE_BIT;
+    n
+}
+
 /// 一条已建立隧道的密钥状态
 pub struct TunnelKeys {
     dh: [u8; 32],
@@ -191,6 +202,10 @@ pub struct TunnelKeys {
     epoch_created: Instant,
     epoch_bytes: u64,
     tx_counter: u64,
+    /// ADR-0002 回执帧独立发送计数器。与 Data 的 tx_counter 是**不相交的
+    /// nonce 空间**（nonce 字节 n[4] 置 0x80 域分离）：回执不插号数据序列，
+    /// 同密钥下也无 nonce 重用。
+    tx_receipt_counter: u64,
     /// 流级分片编号（ADR-024 用户态性能线；0 = 非分片，与历史行为一致）
     shard: u64,
     /// epoch 推进步幅 = 分片总数（默认 1：逐代 +1，Phase 1-5 零回归）。
@@ -199,6 +214,8 @@ pub struct TunnelKeys {
     stride: u64,
     /// 各 epoch 的接收滑动窗口（仅保留最近 GRACE_EPOCHS+1 代）
     rx: BTreeMap<u64, RxWindow>,
+    /// ADR-0002 回执帧独立重放窗（per epoch，与 rx 同 prune 生命周期）
+    rx_receipt: BTreeMap<u64, RxWindow>,
     /// Phase 2：发送侧 Cipher 缓存（(epoch, cipher)）。HKDF（2 次 HMAC-SHA256）
     /// 只在轮换后首包执行一次；advance_epoch/rekey/set_suite 时失效。
     send_cipher: Option<(u64, Cipher)>,
@@ -261,9 +278,11 @@ impl Clone for TunnelKeys {
             epoch_created: self.epoch_created,
             epoch_bytes: self.epoch_bytes,
             tx_counter: self.tx_counter,
+            tx_receipt_counter: self.tx_receipt_counter,
             shard: self.shard,
             stride: self.stride,
             rx: self.rx.clone(),
+            rx_receipt: self.rx_receipt.clone(),
             send_cipher: self.send_cipher.clone(),
             rx_ciphers: self.rx_ciphers.clone(),
         }
@@ -281,9 +300,11 @@ impl TunnelKeys {
             epoch_created: Instant::now(),
             epoch_bytes: 0,
             tx_counter: 0,
+            tx_receipt_counter: 0,
             shard: 0,
             stride: 1,
             rx: BTreeMap::new(),
+            rx_receipt: BTreeMap::new(),
             send_cipher: None,
             rx_ciphers: BTreeMap::new(),
         }
@@ -332,7 +353,9 @@ impl TunnelKeys {
         k.epoch_created = Instant::now();
         k.epoch_bytes = 0;
         k.tx_counter = 0;
+        k.tx_receipt_counter = 0;
         k.rx = BTreeMap::new();
+        k.rx_receipt = BTreeMap::new();
         // 派生的是全新同余 SA：父 SA 缓存的 cipher 属于父 epoch/计数器链，
         // 首包按本分片首代重新派生（HKDF 域分离 epoch 不同，本就不可复用）。
         k.send_cipher = None;
@@ -378,12 +401,45 @@ impl TunnelKeys {
     /// 加密载荷。返回 (**帧头 KeyID 8B**, 帧体 = 计数器(8B) ‖ 密文‖tag)。
     /// `aad` 必须是完整明文 IPv8+ 头字节。
     pub fn seal(&mut self, aad: &[u8], plaintext: &[u8]) -> ([u8; 8], Vec<u8>) {
+        let epoch = self.send_epoch_ready();
+        self.tx_counter += 1;
+        let cipher = &self.send_cipher.as_ref().expect("send_epoch_ready 刚填充").1;
+        let ct = cipher
+            .encrypt(&nonce_for(self.tx_counter), Payload { msg: plaintext, aad })
+            .expect("AEAD encrypt cannot fail for inbounds size");
+        let mut body = Vec::with_capacity(8 + ct.len());
+        body.extend_from_slice(&self.tx_counter.to_be_bytes());
+        body.extend_from_slice(&ct);
+        self.epoch_bytes += body.len() as u64;
+        (self.frame_key_id(epoch), body)
+    }
+
+    /// ADR-0002：密封观测回执帧（Type=7）。与 Data 共享 epoch 密钥代，但
+    /// nonce 走**独立空间**（n[4] 置 0x80）+ 独立计数器/重放窗——回执不
+    /// 在 Data 计数器序列插号（否则对端缺口统计恒见假丢包），也不会同
+    /// 密钥 nonce 重用。回执无 IPv8+ 明文头，AAD 为空。
+    pub fn seal_receipt(&mut self, plaintext: &[u8]) -> ([u8; 8], Vec<u8>) {
+        let epoch = self.send_epoch_ready();
+        self.tx_receipt_counter += 1;
+        let cipher = &self.send_cipher.as_ref().expect("send_epoch_ready 刚填充").1;
+        let nonce = receipt_nonce(self.tx_receipt_counter);
+        let ct = cipher
+            .encrypt(&nonce, Payload { msg: plaintext, aad: &[] })
+            .expect("AEAD encrypt cannot fail for inbounds size");
+        let mut body = Vec::with_capacity(8 + ct.len());
+        body.extend_from_slice(&self.tx_receipt_counter.to_be_bytes());
+        body.extend_from_slice(&ct);
+        self.epoch_bytes += body.len() as u64;
+        (self.frame_key_id(epoch), body)
+    }
+
+    /// 到点轮换 + 发送 cipher 缓存填充，返回当前发送 epoch（Data/回执共用）
+    fn send_epoch_ready(&mut self) -> u64 {
         if self.epoch_bytes >= ROTATE_BYTES
             || self.epoch_created.elapsed() >= Duration::from_secs(ROTATE_SECS)
         {
             self.advance_epoch();
         }
-        self.tx_counter += 1;
         // Phase 2：同 epoch 复用 Cipher，HKDF（2×HMAC-SHA256）每代只做一次
         let epoch = self.send_epoch;
         if !matches!(&self.send_cipher, Some((e, _)) if *e == epoch) {
@@ -392,15 +448,7 @@ impl TunnelKeys {
                 cipher_for(&self.dh, self.suite, epoch, self.is_initiator, true),
             ));
         }
-        let cipher = &self.send_cipher.as_ref().expect("上方刚填充").1;
-        let ct = cipher
-            .encrypt(&nonce_for(self.tx_counter), Payload { msg: plaintext, aad })
-            .expect("AEAD encrypt cannot fail for inbounds size");
-        let mut body = Vec::with_capacity(8 + ct.len());
-        body.extend_from_slice(&self.tx_counter.to_be_bytes());
-        body.extend_from_slice(&ct);
-        self.epoch_bytes += body.len() as u64;
-        (self.frame_key_id(self.send_epoch), body)
+        epoch
     }
 
     /// 解密。`aad` 为完整明文 IPv8+ 头；`key_id` 为帧头 8B（suite‖epoch）。
@@ -408,6 +456,51 @@ impl TunnelKeys {
     /// 降级）；帧内 suite ≠ 本端 → `SuiteMismatch`（配置漂移诊断）。
     /// 重放判定用滑动窗口：乱序可容忍，精确重复/窗外旧包拒绝。
     pub fn open(&mut self, key_id: &[u8; 8], body: &[u8], aad: &[u8]) -> Result<Vec<u8>, FrameError> {
+        if body.len() < 8 {
+            return Err(FrameError::BodyTooShort);
+        }
+        let counter = u64::from_be_bytes(body[..8].try_into().unwrap());
+        let ct = &body[8..];
+        let (epoch, cipher) = self.open_cipher(key_id)?;
+        // 先验密码学完整性，通过才占重放位（篡改包不得污染窗口）
+        match cipher.decrypt(&nonce_for(counter), Payload { msg: ct, aad }) {
+            Ok(pt) => {
+                let accepted = self.rx.entry(epoch).or_default().accept(counter);
+                self.prune();
+                if !accepted {
+                    return Err(FrameError::Replay);
+                }
+                Ok(pt)
+            }
+            Err(_) => Err(FrameError::DecryptFailed),
+        }
+    }
+
+    /// ADR-0002：解密观测回执（独立 nonce 空间 + 独立重放窗），语义同 open。
+    pub fn open_receipt(&mut self, key_id: &[u8; 8], body: &[u8]) -> Result<Vec<u8>, FrameError> {
+        if body.len() < 8 {
+            return Err(FrameError::BodyTooShort);
+        }
+        let counter = u64::from_be_bytes(body[..8].try_into().unwrap());
+        let ct = &body[8..];
+        let (epoch, cipher) = self.open_cipher(key_id)?;
+        match cipher.decrypt(&receipt_nonce(counter), Payload { msg: ct, aad: &[] }) {
+            Ok(pt) => {
+                let accepted = self.rx_receipt.entry(epoch).or_default().accept(counter);
+                self.prune();
+                if !accepted {
+                    return Err(FrameError::Replay);
+                }
+                Ok(pt)
+            }
+            Err(_) => Err(FrameError::DecryptFailed),
+        }
+    }
+
+    /// open/open_receipt 共用前置：套件/epoch 同余类/宽限代校验，
+    /// 并懒派生该代接收 Cipher（两帧类型同代同密钥，缓存共享）。
+    /// 宽限代的"最新代"取 Data/回执两窗的最大值。
+    fn open_cipher(&mut self, key_id: &[u8; 8]) -> Result<(u64, &Cipher), FrameError> {
         let remote_suite = CipherSuite::from_byte(key_id[0]).ok_or(FrameError::UnknownKeyId)?;
         if remote_suite != self.suite {
             return Err(FrameError::SuiteMismatch {
@@ -423,39 +516,20 @@ impl TunnelKeys {
         if epoch % self.stride != self.shard {
             return Err(FrameError::ShardMismatch { epoch, shard: self.shard, stride: self.stride });
         }
-        if body.len() < 8 {
-            return Err(FrameError::BodyTooShort);
-        }
-        let counter = u64::from_be_bytes(body[..8].try_into().unwrap());
-        let ct = &body[8..];
-
         // epoch 宽限窗口：不得比已见最新代旧超过 GRACE_EPOCHS **代**
         // （分片模式下相邻代相差 stride 个 epoch，宽限须按代换算）
-        let max_seen = self.rx.keys().next_back().copied().unwrap_or(epoch);
-        let newest = max_seen.max(epoch);
+        let max_data = self.rx.keys().next_back().copied();
+        let max_receipt = self.rx_receipt.keys().next_back().copied();
+        let newest = max_data.into_iter().chain(max_receipt).max().unwrap_or(epoch).max(epoch);
         if newest > epoch.saturating_add(GRACE_EPOCHS.saturating_mul(self.stride)) {
             return Err(FrameError::StaleEpoch { epoch, newest });
         }
-
         // Phase 2：宽限代内的 Cipher 缓存复用（每代每个 SA 只 HKDF 一次）
         if !self.rx_ciphers.contains_key(&epoch) {
             let c = cipher_for(&self.dh, self.suite, epoch, self.is_initiator, false);
             self.rx_ciphers.insert(epoch, c);
         }
-        let cipher = self.rx_ciphers.get(&epoch).expect("上方刚插入");
-        let win = self.rx.entry(epoch).or_default();
-        // 先验密码学完整性，通过才占重放位（篡改包不得污染窗口）
-        match cipher.decrypt(&nonce_for(counter), Payload { msg: ct, aad }) {
-            Ok(pt) => {
-                if !win.accept(counter) {
-                    self.prune(newest);
-                    return Err(FrameError::Replay);
-                }
-                self.prune(newest);
-                Ok(pt)
-            }
-            Err(_) => Err(FrameError::DecryptFailed),
-        }
+        Ok((epoch, self.rx_ciphers.get(&epoch).expect("上方刚插入")))
     }
 
     /// 轮换后重建（对端经 Rekey 帧提供新临时公钥 → 新 DH）
@@ -463,17 +537,21 @@ impl TunnelKeys {
         self.dh = new_dh;
         self.advance_epoch();
         self.rx.clear();
+        self.rx_receipt.clear();
         // 新 DH → 全部旧接收派生失效（advance_epoch 已清发送侧缓存）
         self.rx_ciphers.clear();
     }
 
-    fn prune(&mut self, newest: u64) {
+    fn prune(&mut self) {
+        // 最新代取 Data/回执两窗的最大者；两窗皆空则无可裁
+        let Some(&newest) = self.rx.keys().chain(self.rx_receipt.keys()).max() else {
+            return;
+        };
         let floor = newest.saturating_sub(GRACE_EPOCHS.saturating_mul(self.stride));
-        let keep = self.rx.split_off(&floor);
-        self.rx = keep;
         // Cipher 缓存与重放窗同生命周期：保留 >= floor 的代，其余随窗淘汰
-        let keep_ciphers = self.rx_ciphers.split_off(&floor);
-        self.rx_ciphers = keep_ciphers;
+        self.rx = self.rx.split_off(&floor);
+        self.rx_receipt = self.rx_receipt.split_off(&floor);
+        self.rx_ciphers = self.rx_ciphers.split_off(&floor);
     }
 
     fn advance_epoch(&mut self) {
@@ -482,6 +560,7 @@ impl TunnelKeys {
         self.epoch_created = Instant::now();
         self.epoch_bytes = 0;
         self.tx_counter = 0;
+        self.tx_receipt_counter = 0;
         // 新代 Cipher 由下一次 seal 懒派生（同代内继续命中缓存）
         self.send_cipher = None;
     }
@@ -595,6 +674,28 @@ mod tests {
         let (kid, body) = a.seal(AAD, b"once");
         assert!(b.open(&kid, &body, AAD).is_ok());
         assert_eq!(b.open(&kid, &body, AAD), Err(FrameError::Replay));
+    }
+
+    #[test]
+    fn receipt_nonce_space_isolated_from_data() {
+        let (mut a, mut b) = pair();
+        // 两空间首帧计数器线上值同为 1，但 nonce 构造性不同
+        let (kd, bd) = a.seal(AAD, b"data-1");
+        let (kr, br) = a.seal_receipt(b"receipt-1");
+        assert_eq!(&bd[..8], &br[..8], "线上计数器字段各自独立编号，首帧都是 1");
+        // 各自正常开
+        assert_eq!(b.open(&kd, &bd, AAD).unwrap(), b"data-1");
+        assert_eq!(b.open_receipt(&kr, &br).unwrap(), b"receipt-1");
+        // 交叉开：nonce 不匹配 → 认证失败（证明不是同一空间）
+        assert_eq!(b.open(&kr, &br, AAD), Err(FrameError::DecryptFailed));
+        assert_eq!(b.open_receipt(&kd, &bd), Err(FrameError::DecryptFailed));
+        // 回执精确重放独立判重
+        assert_eq!(b.open_receipt(&kr, &br), Err(FrameError::Replay));
+        // Data 继续编号 2、3 不受回执插号影响，无假缺口
+        let (_, bd2) = a.seal(AAD, b"data-2");
+        let (_, bd3) = a.seal(AAD, b"data-3");
+        assert!(b.open(&kd, &bd2, AAD).is_ok());
+        assert!(b.open(&kd, &bd3, AAD).is_ok());
     }
 
     #[test]

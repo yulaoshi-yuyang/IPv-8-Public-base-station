@@ -29,6 +29,7 @@ use rio::{RioMode, RioPacket, UdpIo};
 use ipv8_codec::IPv8Address;
 use ipv8_compat::{process_inbound, process_outbound, Outcome as CompatOutcome};
 use ipv8_fec::{FecRx, FecTx};
+use ipv8_observe::{ObserveConfig, ObserveNode, PathId};
 use ipv8_hook::{Action as HookAction, Direction as HookDirection, HookBus, HookConfig, PacketEvent};
 use ipv8_tunnel::auth::{
     pop_sign, provision, register_pop_message, verify_key_from_seed, Cert, CertAuthority,
@@ -52,22 +53,6 @@ const PEER_KEY: &str = "peer";
 
 /// 弱凭据入口刷新的限速窗：同窗内至多改址一次（防持续伪造源地址长期抢占）
 const ROAM_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// 内层 IP 包的 DSCP（0 = 尽力而为，Phase 4 --fec 的 QoS 门控判据）。
-///
-/// 协议正确取法（spec FR-4 意图 = DSCP≠0，实现按 RFC 精确提取）：
-/// - IPv4：DS 字段 = byte[1]，DSCP = 高 6 位 = `byte[1] >> 2`；
-/// - IPv6：Traffic Class 8 位跨两字节——`byte[0] 低 4 位 ‖ byte[1] 高 4 位`，
-///   DSCP = TC 高 6 位 = `(byte[0]&0x0F)<<2 | byte[1]>>6`。
-///
-/// 长度不足 / 非_IPV_ 版本 → None（调用方按未标记处理）。
-fn inner_dscp(pkt: &[u8]) -> Option<u8> {
-    match pkt.first()? >> 4 {
-        4 if pkt.len() >= 2 => Some(pkt[1] >> 2),
-        6 if pkt.len() >= 2 => Some(((pkt[0] & 0x0F) << 2) | (pkt[1] >> 6)),
-        _ => None,
-    }
-}
 
 /// 外层 UDP 包发往哪里（由调度状态机 [`Sched`] 决定）
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1332,9 +1317,21 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
         mp_alt: Option<SocketAddr>,
         /// Phase 4 --fec：FEC 收发状态机对；None = 关闭（Type=6 由引擎静默丢）
         fec: Option<Arc<FecNode>>,
+        /// ADR-0002 观测底座：入站计数/回执往返/--mp 熔断与 FEC 门控信号源
+        observe: Arc<Mutex<ObserveNode>>,
+        /// 观测时钟锚点：全 Plane 共用同一相对时基（ms 判窗/us 算 RTT）
+        clock_anchor: std::time::Instant,
     }
 
     impl Plane {
+        /// ADR-0002：观测相对时钟（锚点在建 Plane 时归零，跨机只回显不比绝对值）
+        fn now_ms(&self) -> u64 {
+            self.clock_anchor.elapsed().as_millis() as u64
+        }
+        fn now_us(&self) -> u64 {
+            self.clock_anchor.elapsed().as_micros() as u64
+        }
+
         /// Phase 3：把 ICMP 差错报文写回本地 TUN（不进隧道）
         fn inject_icmp(&self, icmp_pkt: &[u8]) {
             let Some(s) = &self.session else { return };
@@ -1407,6 +1404,39 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
                         let _ = fec.rx.lock().expect("fec-rx").observe_data(raw);
                     }
                 }
+            }
+            // ---- ADR-0002 观测底座：回执分流 + Data 帧计数 ----
+            // 必须在 hub.feed/引擎之前：分片活跃时 Data 帧由 workers 接管，
+            // 只有这里覆盖得到全部入站帧（计数器明文在帧尾，无需解密）；
+            // FEC 重建帧递归进本函数，迟到原件只多记一次 dup（统计正确）。
+            if n >= 2 && raw[0] == 0x01 && (raw[1] == 7 || raw[1] == 2) {
+                if raw[1] == 7 {
+                    // 回执：主 SA 开壳（与 Data 独立的 nonce/重放空间）后喂观测器。
+                    // 锁不嵌套：engine 临时锁语句末释放，再取 observe，避免与
+                    // 回执周期线程（observe→engine）构成锁序环。
+                    let opened = self.engine.lock().expect("engine").open_receipt(raw);
+                    if let Some(report) = opened {
+                        if let Err(e) = self
+                            .observe
+                            .lock()
+                            .expect("observe")
+                            .ingest_report(self.now_ms(), self.now_us(), &report)
+                        {
+                            tracing::debug!(error = ?e, "[observe] 回执拒绝");
+                        }
+                    }
+                    return;
+                }
+                // Data：按入站 socket 归属路径（--mp 备用入口 → alt 槽）
+                let path = if Some(from) == self.mp_alt {
+                    PathId::Alt
+                } else {
+                    PathId::Main
+                };
+                self.observe
+                    .lock()
+                    .expect("observe")
+                    .observe_inbound(self.now_ms(), path, raw);
             }
             // 明文降级入包：非隧道帧（Ver 字节≠0x01）→ 直接注入 TUN。
             // 仅在 -Fallback 验证下启用，避免改变既有模式丢弃语义。
@@ -1636,14 +1666,20 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
                     // Phase 4 --mp：第二目的地（备用入口）。send 错误仅计数不阻断，
                     // 备用路径不可达不影响主路径（FR-1）
                     let mp_alt = self.mp_alt;
+                    // ADR-0002：批级读一次出站策略（不进逐包循环取锁）。
+                    // alt_disabled=观测熔断（main 活 alt 死透）；fec_on=自适应门控。
+                    let (alt_disabled, fec_on) = {
+                        let ob = self.observe.lock().expect("observe");
+                        (ob.alt_disabled(), ob.fec_enabled())
+                    };
                     let mut out: Vec<Vec<u8>> = Vec::new();
                     {
                         let mut g = self.engine.lock().expect("engine");
                         for bytes in &batch {
-                            // Phase 4 --fec：QoS 门控在密封前判一次（每包一次），
-                            // 同一内层包密封出的全部分片继承标记（FR-4）
-                            let marked =
-                                self.fec.is_some() && inner_dscp(bytes).is_some_and(|d| d != 0);
+                            // ADR-0002：FEC 入组由观测门控（对端方向 union 丢包率
+                            // 滞回判决），不再按内层 DSCP 静态标记——DSCP 与实际
+                            // 路径质量无关。同一内层包的全部分片继承本判定（FR-4）。
+                            let marked = self.fec.is_some() && fec_on;
                             match g.seal_frames(bytes) {
                                 Ok(frames) => {
                                     if marked {
@@ -1674,7 +1710,9 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
                         if let Err(e) = self.udp.send_to(frame, dest) {
                             tracing::warn!(error = %e, "[udp] send 失败");
                         }
-                        if let Some(alt) = mp_alt {
+                        // ADR-0002：熔断期间跳过备用路径（省一份白烧的带宽），
+                        // 5 连高质量窗后自动恢复双发
+                        if let Some(alt) = mp_alt.filter(|_| !alt_disabled) {
                             if let Err(e) = self.udp.send_to(frame, alt) {
                                 tracing::warn!(error = %e, target = %alt, "[udp] 备用路径 send 失败");
                             }
@@ -1733,11 +1771,46 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
         } else {
             None
         },
+        observe: Arc::new(Mutex::new(ObserveNode::new(ObserveConfig {
+            dual_path: cfg.mp,
+            ..Default::default()
+        }))),
+        clock_anchor: std::time::Instant::now(),
     });
 
     /// 单批 TUN 排空上界：wintun 官方 C API 只有单包 Receive/Send，
     /// 真正省的是每包一次 engine/sched 互斥锁与逐包 send 的调用开销。
     const TUN_BATCH_CAP: usize = 64;
+
+    // ADR-0002 观测回执线程：50ms tick，由观测器按 200ms 自己的节奏出报告，
+    // 主 SA 密封 Type=7 发往当前隧道入口。空载也发——活性信号不能依赖数据流量；
+    // 未建链时 seal_receipt 返回 None，线程空转。锁严格顺序取用不嵌套
+    // （observe→engine→sched），与入站路径（engine→observe）不成环。
+    {
+        let plane = plane.clone();
+        std::thread::Builder::new()
+            .name("observe".into())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(50));
+                let report = plane
+                    .observe
+                    .lock()
+                    .expect("observe")
+                    .maybe_build_report(plane.now_ms(), plane.now_us());
+                let Some(report) = report else { continue };
+                let frame = plane
+                    .engine
+                    .lock()
+                    .expect("engine")
+                    .seal_receipt(&report);
+                let Some(frame) = frame else { continue };
+                let dest = match plane.sched.lock().expect("sched").transport.clone() {
+                    Transport::Tunnel(d) | Transport::PlainUdp(d) => d,
+                };
+                let _ = plane.udp.send_to(&frame, dest);
+            })
+            .expect("spawn observe");
+    }
 
     // --no-tun 发起方：Established 后周期注入合成包（两种 I/O 模式都保留；
     // 该线程只发不收）。载荷 = magic(5) ‖ seq(4) ‖ 填充(0xA5…)；
@@ -2617,21 +2690,6 @@ mod tests {
         // 空白 net-id 视为未提供（防手滑开不出模式）
         let c2 = parse_args_from(&p4_argv(&["--ula", "  "])).expect("空白仍可解析");
         assert!(c2.ula_net_id.is_none() && c2.tun_ipv6.is_none());
-    }
-
-    #[test]
-    fn inner_dscp_v4_v6_and_garbage() {
-        // IPv4：EF = 46 → byte[1] = 46<<2 = 184；DSCP=0 → byte[1] 低 2 位任意
-        assert_eq!(inner_dscp(&[0x45, 184]), Some(46));
-        assert_eq!(inner_dscp(&[0x45, 0x03]), Some(0), "低 2 位 ECN 不算 DSCP");
-        // IPv6：TC 8 位跨字节——byte0 低 4b=TC[7..4]，byte1 高 2b=TC[3..2]。
-        // EF=46=0b101110 → byte0=0x6|0xB=0x6B，byte1=0b10<<6|FL=0x80
-        assert_eq!(inner_dscp(&[0x6B, 0x80]), Some(46));
-        assert_eq!(inner_dscp(&[0x60, 0x00]), Some(0));
-        // 畸形：短包 / 非 IP 版本
-        assert_eq!(inner_dscp(&[0x45]), None);
-        assert_eq!(inner_dscp(&[]), None);
-        assert_eq!(inner_dscp(&[0x30, 0x00]), None);
     }
 
     /// AC-5：--mp 开时两路径交替到达不触发入口刷新（transport 稳定）

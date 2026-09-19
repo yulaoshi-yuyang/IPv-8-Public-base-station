@@ -96,7 +96,7 @@ impl ObserveNode {
         accepted
     }
 
-    /// 周期到达时产出回执帧载荷（100B）；未到周期返回 None
+    /// 周期到达时产出回执帧载荷（124B）；未到周期返回 None
     pub fn maybe_build_report(&mut self, now_ms: u64, now_us: u64) -> Option<[u8; REPORT_LEN]> {
         if let Some(last) = self.last_report_ms {
             if now_ms.saturating_sub(last) < self.cfg.report_interval_ms {
@@ -130,7 +130,7 @@ impl ObserveNode {
         Some(report::encode(&report))
     }
 
-    /// 摄入对端回执（解密后的 100B 载荷）。首份只建基线不推进策略。
+    /// 摄入对端回执（解密后的 124B 载荷）。首份只建基线不推进策略。
     pub fn ingest_report(&mut self, now_ms: u64, now_us: u64, bytes: &[u8]) -> Result<(), ReportError> {
         let r = report::decode(bytes)?;
         self.rtt.on_peer_report(now_us, &r);

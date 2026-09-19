@@ -13,6 +13,7 @@ path = "src/main.rs"
 ipv8-codec = { workspace = true }
 ipv8-compat = { workspace = true }
 ipv8-fec = { path = "../../core/ipv8-fec" }
+ipv8-observe = { workspace = true }
 ipv8-hook = { path = "../../core/ipv8-hook" }
 ipv8-tunnel = { path = "../../core/ipv8-tunnel" }
 ipv8-grpc = { path = "../../core/ipv8-grpc" }

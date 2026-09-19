@@ -981,6 +981,7 @@ dependencies = [
  "ipv8-fec",
  "ipv8-grpc",
  "ipv8-hook",
+ "ipv8-observe",
  "ipv8-resolver",
  "ipv8-tunnel",
  "ipv8-zoneserver",
