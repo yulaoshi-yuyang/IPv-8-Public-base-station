@@ -16,8 +16,62 @@
 
 param(
     [switch]$Background,
-    [int]$PortalPort = 9001
+    [int]$PortalPort = 9001,
+    [switch]$InstallAutoStart,
+    [switch]$RemoveAutoStart
 )
+
+# -- 开机自启管理（独立入口，执行后直接退出，不进入启动流程）--
+$taskName = "IPv8-AutoStart"
+
+if ($InstallAutoStart -or $RemoveAutoStart) {
+    $scriptPath = $MyInvocation.MyCommand.Path
+
+    if ($InstallAutoStart) {
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+            -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -Background" `
+            -WorkingDirectory $PSScriptRoot
+
+        $trigger = New-ScheduledTaskTrigger -AtLogOn
+        $trigger.Delay = "PT30S"   # 登录后延迟 30 秒启动
+
+        # 注意：RestartInterval 系统硬限制最小 1 分钟（PT1M），30 秒会被拒绝
+        $settings = New-ScheduledTaskSettingsSet `
+            -StartWhenAvailable `
+            -RestartCount 3 `
+            -RestartInterval (New-TimeSpan -Minutes 1) `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
+            -MultipleInstances IgnoreNew
+
+        $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
+            -LogonType Interactive -RunLevel Limited
+
+        try {
+            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+                -Settings $settings -Principal $principal -Force -ErrorAction Stop | Out-Null
+        } catch {
+            Write-Host "[X] 注册失败：$_" -ForegroundColor Red
+            exit 1
+        }
+
+        Write-Host "[OK] 已注册开机自启任务：$taskName" -ForegroundColor Green
+        Write-Host "  登录后 30 秒自动启动，失败每 1 分钟重试（最多 3 次，系统最小间隔）"
+        Write-Host "  查看：Get-ScheduledTask -TaskName $taskName"
+        exit 0
+    }
+
+    if ($RemoveAutoStart) {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+            Write-Host "[X] 移除失败" -ForegroundColor Red
+            exit 1
+        }
+        Write-Host "[OK] 已移除开机自启任务：$taskName" -ForegroundColor Green
+        exit 0
+    }
+}
 
 $ErrorActionPreference = "Stop"
 $projectRoot = $PSScriptRoot
@@ -151,36 +205,47 @@ if (-not (Test-Path $cloudflared)) {
     $tunnelLog = Join-Path $logDir "tunnel-$stamp.log"
     $tunnelErr = Join-Path $logDir "tunnel-$stamp-err.log"
     $tunnelArgs = "tunnel --config `"$tunnelConfig`" run --protocol quic"
-    $tunnelProc = Start-Process -FilePath $cloudflared `
-        -ArgumentList $tunnelArgs `
-        -WindowStyle Hidden -PassThru -RedirectStandardOutput $tunnelLog -RedirectStandardError $tunnelErr
-    $tunnelPid = $tunnelProc.Id
-    Write-OK "隧道进程已启动 (PID: $tunnelPid)"
-    Write-Host "  日志: $tunnelLog" -ForegroundColor DarkGray
 
-    # -- 5. 验证隧道 --
-    Write-Step "[5/5] 验证隧道连通..." "Yellow"
-    Start-Sleep 5
-
+    # cloudflared 在网络未就绪时（如开机自启早期，DNS 解析 argotunnel.com 超时）会
+    # 直接退出，因此启动后检测到进程退出就重启，最多 3 次，间隔 10 秒。
     $tunnelOk = $false
-    for ($i = 0; $i -lt 12; $i++) {
-        try {
-            $resp = Invoke-WebRequest -Uri "https://ipv8.yulaoshi.xyz" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-            if ($resp.StatusCode -eq 200) {
-                $tunnelOk = $true
-                break
-            }
-        } catch {
-            # 隧道还在连接中
+    $tunnelPid = 0
+    for ($attempt = 1; $attempt -le 3 -and -not $tunnelOk; $attempt++) {
+        if ($attempt -gt 1) {
+            Write-Warn "隧道进程已退出（第 $($attempt-1) 次，多为开机早期 DNS 未就绪），10 秒后重启..."
+            Start-Sleep 10
         }
-        Start-Sleep 2
-        Write-Host "." -NoNewline
+        $tunnelProc = Start-Process -FilePath $cloudflared `
+            -ArgumentList $tunnelArgs `
+            -WindowStyle Hidden -PassThru -RedirectStandardOutput $tunnelLog -RedirectStandardError $tunnelErr
+        $tunnelPid = $tunnelProc.Id
+        Write-OK "隧道进程已启动 (PID: $tunnelPid)"
+        Write-Host "  日志: $tunnelLog" -ForegroundColor DarkGray
+
+        # -- 5. 验证隧道 --
+        Write-Step "[5/5] 验证隧道连通..." "Yellow"
+        Start-Sleep 5
+
+        for ($i = 0; $i -lt 12; $i++) {
+            if ($tunnelProc.HasExited) { break }   # 进程已死，别傻等，回到重启
+            try {
+                $resp = Invoke-WebRequest -Uri "https://ipv8.yulaoshi.xyz" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+                if ($resp.StatusCode -eq 200) {
+                    $tunnelOk = $true
+                    break
+                }
+            } catch {
+                # 隧道还在连接中
+            }
+            Start-Sleep 2
+            Write-Host "." -NoNewline
+        }
     }
 
     if ($tunnelOk) {
         Write-OK "隧道连通: https://ipv8.yulaoshi.xyz -> 127.0.0.1:$PortalPort"
     } else {
-        Write-Warn "隧道仍在连接中（QUIC 建连需 10-30 秒），请稍后访问 https://ipv8.yulaoshi.xyz"
+        Write-Warn "隧道仍未连通（重试 3 次），请检查 deploy\portal\logs\ 下 tunnel 日志后手动运行 start-ipv8.ps1"
     }
 
     # 记录 PID

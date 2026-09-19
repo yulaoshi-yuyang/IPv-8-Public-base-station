@@ -52,7 +52,7 @@
       <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Link>
-      <AdditionalDependencies>%(AdditionalDependencies);user32.lib;comctl32.lib;ole32.lib;advapi32.lib;shell32.lib</AdditionalDependencies>
+      <AdditionalDependencies>%(AdditionalDependencies);user32.lib;comctl32.lib;ole32.lib;advapi32.lib;shell32.lib;iphlpapi.lib</AdditionalDependencies>
       <ModuleDefinitionFile>ipv8prop.def</ModuleDefinitionFile>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <SubSystem>Windows</SubSystem>

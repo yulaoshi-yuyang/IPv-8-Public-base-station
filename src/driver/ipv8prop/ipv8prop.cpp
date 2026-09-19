@@ -27,6 +27,9 @@ Abstract:
 
 #include <windows.h>
 #include <winioctl.h>
+#include <winsock2.h>
+#include <ws2ipdef.h>
+#include <iphlpapi.h>
 #include <commctrl.h>
 #include <objbase.h>
 #include <netcfgn.h>
@@ -34,6 +37,8 @@ Abstract:
 #include <new>
 #include <cstdio>
 #include "resource.h"
+
+#pragma comment(lib, "iphlpapi.lib")
 
 /* 属性页/notify object COM 类 ID，必须与 ipv8proto.inf 中
    "HKR, Ndi, Clsid, ..." 的 GUID 完全一致。 */
@@ -429,15 +434,109 @@ static void InitListColumns(HWND hDlg, HWND lv)
     }
 }
 
+/* 包数/丢包数是无符号整数计数：要 locale 千分位但不要小数位。
+   不传 NUMBERFMT 时 GetNumberFormatW 会按 locale 默认 NumDigits=2
+   把 0 渲染成 "0.00"，故显式 NumDigits=0。 */
 static void FormatCount(unsigned long long v, wchar_t* out, int cch)
 {
     wchar_t raw[32];
     swprintf_s(raw, L"%llu", v);
-    if (!GetNumberFormatW(LOCALE_USER_DEFAULT, 0, raw, nullptr, out, cch))
+
+    wchar_t thou[8], dot[8];
+    int n1 = GetLocaleInfoW(LOCALE_USER_DEFAULT, LOCALE_STHOUSAND,
+        thou, (int)(sizeof(thou) / sizeof(wchar_t)));
+    int n2 = GetLocaleInfoW(LOCALE_USER_DEFAULT, LOCALE_SDECIMAL,
+        dot, (int)(sizeof(dot) / sizeof(wchar_t)));
+
+    NUMBERFMTW nf = {};
+    nf.NumDigits      = 0;
+    nf.LeadingZero    = 1;
+    nf.Grouping       = 3;
+    nf.lpDecimalSep   = (n2 > 0) ? dot  : (wchar_t*)L".";
+    nf.lpThousandSep  = (n1 > 0) ? thou : (wchar_t*)L",";
+    nf.NegativeOrder  = 0;
+
+    if (!GetNumberFormatW(LOCALE_USER_DEFAULT, 0, raw, &nf, out, cch))
         wcscpy_s(out, (size_t)cch, raw);
 }
 
-static void FillAdapterRow(HWND lv, int row, const IPV8_BINDING_ENTRY& e)
+/* 驱动给的适配器名是 NDIS 设备路径 \DEVICE\{接口GUID}，对普通用户不可读。
+   用 iphlpapi 建一张 GUID(大写) → 系统别名（ncpa 显示的 WLAN/以太网…）表；
+   查不到时回退原始设备名，绝不臆造。每次刷新重建（改名/插拔后即更新）。 */
+struct AliasEntry {
+    wchar_t Guid[40];
+    wchar_t Alias[256];
+};
+static const int kMaxAliasEntries = 64;
+
+static int BuildAliasMap(AliasEntry* map, int capacity)
+{
+    ULONG bufLen = 0;
+    /* 只要 AdapterName(GUID) 与 FriendlyName(别名)，其余地址信息全跳过。 */
+    ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST
+                | GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_SKIP_UNICAST;
+    ULONG ret = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, nullptr, &bufLen);
+    if (ret != ERROR_BUFFER_OVERFLOW || bufLen == 0)
+        return 0;
+
+    unsigned char* heap = new (std::nothrow) unsigned char[bufLen];
+    if (!heap)
+        return 0;
+
+    int count = 0;
+    ret = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr,
+        (IP_ADAPTER_ADDRESSES*)heap, &bufLen);
+    if (ret == NO_ERROR) {
+        for (IP_ADAPTER_ADDRESSES* aa = (IP_ADAPTER_ADDRESSES*)heap;
+             aa && count < capacity; aa = aa->Next) {
+            /* AdapterName 是 ANSI 的 "{GUID}"；FriendlyName 是系统别名。 */
+            if (!aa->AdapterName || !aa->FriendlyName)
+                continue;
+            wchar_t wguid[40];
+            int wlen = MultiByteToWideChar(CP_ACP, 0, aa->AdapterName, -1,
+                wguid, (int)(sizeof(wguid) / sizeof(wchar_t)));
+            if (wlen <= 0)
+                continue;
+            int i = 0;
+            for (; wguid[i] && i < 39; ++i)
+                map[count].Guid[i] = (wchar_t)towupper(wguid[i]);
+            map[count].Guid[i] = 0;
+            wcsncpy_s(map[count].Alias, aa->FriendlyName,
+                (size_t)(sizeof(map[count].Alias) / sizeof(wchar_t)) - 1);
+            ++count;
+        }
+    }
+    delete[] heap;
+    return count;
+}
+
+/* 从 \DEVICE\{GUID} 取出指向 '{' 的子串（大写比较）；无花括号则原样返回。 */
+static const wchar_t* GuidPart(const wchar_t* dev)
+{
+    const wchar_t* p = wcsrchr(dev, L'{');
+    return p ? p : dev;
+}
+
+static const wchar_t* LookupAlias(const AliasEntry* map, int count,
+    const wchar_t* deviceName)
+{
+    const wchar_t* key = GuidPart(deviceName);
+    for (int i = 0; i < count; ++i) {
+        const wchar_t* a = map[i].Guid;
+        const wchar_t* b = key;
+        bool eq = true;
+        while (*a && *b) {
+            if (towupper(*a) != towupper(*b)) { eq = false; break; }
+            ++a; ++b;
+        }
+        if (eq && *a == 0 && *b == 0)
+            return map[i].Alias;
+    }
+    return nullptr;
+}
+
+static void FillAdapterRow(HWND lv, int row, const IPV8_BINDING_ENTRY& e,
+    const AliasEntry* aliasMap, int aliasCount)
 {
     wchar_t idx[16], mac[24], rx[32], tx[32], rxd[32], txd[32], drop[80];
     swprintf_s(idx, L"%d", row + 1);
@@ -451,13 +550,17 @@ static void FillAdapterRow(HWND lv, int row, const IPV8_BINDING_ENTRY& e)
     memcpy(name, e.Name, cc * sizeof(wchar_t));
     name[cc] = 0;
 
+    /* 优先展示系统别名（WLAN/以太网…），映射不到再用设备路径，不臆造。 */
+    const wchar_t* display = LookupAlias(aliasMap, aliasCount, name);
+    const wchar_t* col1 = display ? display : name;
+
     LVITEMW lvi = {};
     lvi.mask = LVIF_TEXT;
     lvi.iItem = row;
     lvi.iSubItem = 0;
     lvi.pszText = idx;
     ListView_InsertItem(lv, &lvi);
-    ListView_SetItemText(lv, row, 1, name);
+    ListView_SetItemText(lv, row, 1, (LPWSTR)col1);
     ListView_SetItemText(lv, row, 2, mac);
 
     if (e.Bound) {
@@ -519,10 +622,12 @@ static void ReloadAdapters(HWND hDlg)
     }
 
     unsigned long boundCount = 0;
+    AliasEntry aliasMap[kMaxAliasEntries];
+    int aliasCount = BuildAliasMap(aliasMap, kMaxAliasEntries);
     for (unsigned long i = 0; i < b->Count; ++i) {
         if (b->Entries[i].Bound)
             ++boundCount;
-        FillAdapterRow(lv, (int)i, b->Entries[i]);
+        FillAdapterRow(lv, (int)i, b->Entries[i], aliasMap, aliasCount);
     }
 
     wchar_t status[160];
