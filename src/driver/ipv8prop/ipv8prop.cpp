@@ -25,6 +25,9 @@ Abstract:
 
 #define ISOLATION_AWARE_ENABLED 1   /* 控件经本 DLL 的 comctl32 v6 清单渲染 */
 
+/* 注意：winsock2.h 必须在 windows.h 之前或依赖 WIN32_LEAN_AND_MEAN（vcxproj 已定义）。
+   去掉该宏会导致 windows.h 拉入 winsock.h，与 winsock2.h 重定义冲突。
+   iphlpapi.h 的 GetAdaptersAddresses 用于解析 NDIS 设备 GUID → 系统别名。 */
 #include <windows.h>
 #include <winioctl.h>
 #include <winsock2.h>

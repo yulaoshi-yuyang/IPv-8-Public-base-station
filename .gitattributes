@@ -1,0 +1,28 @@
+# 统一行尾：文本文件自动规范化为 LF（仓库内），检出时按操作系统转换。
+# 根治 .gitignore 等文件反复出现的 CRLF/LF 噪声 diff。
+* text=auto
+
+# 明确声明的纯文本类型
+*.rs text eol=lf
+*.ps1 text eol=crlf
+*.md text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.cpp text eol=crlf
+*.h text eol=crlf
+*.c text eol=crlf
+*.cs text eol=crlf
+*.vcxproj text eol=crlf
+*.inf text eol=crlf
+
+# 二进制
+*.dll binary
+*.sys binary
+*.exe binary
+*.cat binary
+*.cer binary
+*.png binary
+*.jpg binary
+*.ico binary

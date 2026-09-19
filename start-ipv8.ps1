@@ -202,15 +202,16 @@ if (-not (Test-Path $cloudflared)) {
     Write-Fail "隧道配置文件不存在: $tunnelConfig"
     Write-Warn "跳过隧道启动"
 } else {
-    $tunnelLog = Join-Path $logDir "tunnel-$stamp.log"
-    $tunnelErr = Join-Path $logDir "tunnel-$stamp-err.log"
     $tunnelArgs = "tunnel --config `"$tunnelConfig`" run --protocol quic"
 
     # cloudflared 在网络未就绪时（如开机自启早期，DNS 解析 argotunnel.com 超时）会
     # 直接退出，因此启动后检测到进程退出就重启，最多 3 次，间隔 10 秒。
+    # 每次尝试用独立日志文件，避免重启时覆盖前一次失败的证据。
     $tunnelOk = $false
     $tunnelPid = 0
     for ($attempt = 1; $attempt -le 3 -and -not $tunnelOk; $attempt++) {
+        $tunnelLog = Join-Path $logDir "tunnel-$stamp-attempt$attempt.log"
+        $tunnelErr = Join-Path $logDir "tunnel-$stamp-attempt$attempt-err.log"
         if ($attempt -gt 1) {
             Write-Warn "隧道进程已退出（第 $($attempt-1) 次，多为开机早期 DNS 未就绪），10 秒后重启..."
             Start-Sleep 10
@@ -245,6 +246,10 @@ if (-not (Test-Path $cloudflared)) {
     if ($tunnelOk) {
         Write-OK "隧道连通: https://ipv8.yulaoshi.xyz -> 127.0.0.1:$PortalPort"
     } else {
+        # 设计意图：隧道失败不抛错、不 exit 1。门户已起来是主目标，
+        # 隧道是"尽力而为"——计划任务的 -RestartCount 仅在非零退出时触发，
+        # 若此处 exit 1 会导致整个服务（含门户）被每分钟重启，得不偿失。
+        # 隧道自身已有 3 次重启循环兜底。
         Write-Warn "隧道仍未连通（重试 3 次），请检查 deploy\portal\logs\ 下 tunnel 日志后手动运行 start-ipv8.ps1"
     }
 
