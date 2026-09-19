@@ -42,7 +42,7 @@ powershell -ExecutionPolicy Bypass -File scripts\notun-selftest.ps1
 
 ## 目录地图
 
-- `src/core/` — 协议栈 11 个 crate：codec / routing / qos / tunnel / grpc / ffi / firewall / hook / compat / fec / neigh
+- `src/core/` — 协议栈 12 个 crate：codec / routing / qos / tunnel / grpc / ffi / firewall / hook / compat / fec / neigh / observe
 - `src/adapter/` — wintun 节点（单二进制，dll 内嵌自举，RIO 数据面）
 - `src/cloud/` — 云端服务：ans（地址分配）/ resolver（会合解析）/ zoneserver（区域服务）
 - `src/driver/` — NDIS 协议驱动 ipv8proto 与属性页 ipv8prop（P8，开发用）

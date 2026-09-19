@@ -914,6 +914,10 @@ name = "ipv8-netbench"
 version = "0.9.0"
 
 [[package]]
+name = "ipv8-observe"
+version = "0.9.0"
+
+[[package]]
 name = "ipv8-qos"
 version = "0.9.0"
 dependencies = [

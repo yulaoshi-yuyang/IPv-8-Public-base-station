@@ -1,0 +1,8 @@
+[package]
+name = "ipv8-observe"
+description = "IPv8+ 隧道观测底座：Data 帧计数器缺口统计、100B 回执帧编解码、RTCP 式 RTT、mp 熔断与 FEC 门控滞回（纯函数，零依赖；ADR-0002）"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]

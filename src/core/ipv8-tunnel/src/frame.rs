@@ -8,7 +8,8 @@
 //! ```
 //!
 //! - Ver  固定 0x01
-//! - Type 0=HandshakeInit 1=HandshakeResp 2=Data 3=Rekey
+//! - Type 0=HandshakeInit 1=HandshakeResp 2=Data 3=Rekey 4=AuthInit 5=AuthResp
+//!   6=FecRecovery 7=Receipt（观测回执，载荷见 ipv8-observe crate；node 层分流，AEAD 密封）
 //! - KeyID = suite(1B, ADR-025；0=ChaCha20 默认) ‖ epoch（大端）。默认套件下
 //!   与"纯 epoch 大端 8B"逐字节相同（epoch 恒 < 2^56），向后兼容是构造性的。
 //!
@@ -37,6 +38,8 @@ pub enum FrameType {
     AuthResp = 5,
     /// FEC XOR 恢复帧（Phase 4，帧体见 ipv8-fec crate；引擎不处理，node 层分流）
     FecRecovery = 6,
+    /// 观测回执帧（ADR-0002，帧体=ipv8-observe 的 124B 报告，AEAD 密封；引擎不处理，node 层分流）
+    Receipt = 7,
 }
 
 impl FrameType {
@@ -49,6 +52,7 @@ impl FrameType {
             4 => Some(Self::AuthInit),
             5 => Some(Self::AuthResp),
             6 => Some(Self::FecRecovery),
+            7 => Some(Self::Receipt),
             _ => None,
         }
     }
@@ -206,9 +210,19 @@ mod tests {
         let h = parse_head(&f).expect("Type=6 必须可解析");
         assert_eq!(h.frame_type, FrameType::FecRecovery);
         assert_eq!(h.key_id, [0x11; 8]);
-        // 越界类型仍拒绝
+    }
+
+    #[test]
+    fn parse_head_type7_receipt_roundtrip() {
+        // ADR-0002：Receipt=7 解析往返；越界类型 8 仍拒绝
+        let mut f = Vec::new();
+        write_head(&mut f, FrameType::Receipt, &[0x22; 8]);
+        assert_eq!(f[1], 7);
+        let h = parse_head(&f).expect("Type=7 必须可解析");
+        assert_eq!(h.frame_type, FrameType::Receipt);
+        assert_eq!(h.key_id, [0x22; 8]);
         let mut bad = f;
-        bad[1] = 7;
-        assert!(matches!(parse_head(&bad), Err(FrameError::BadType(7))));
+        bad[1] = 8;
+        assert!(matches!(parse_head(&bad), Err(FrameError::BadType(8))));
     }
 }

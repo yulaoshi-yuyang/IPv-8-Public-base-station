@@ -473,6 +473,9 @@ impl Engine {
             // FEC 恢复帧（Phase 4）：引擎不参与恢复——node 层在引擎之外喂
             // FecRx；`--fec` 关闭时到这里的 Type=6 帧静默丢弃（零回归）
             FrameType::FecRecovery => None,
+            // 观测回执帧（ADR-0002）：引擎不参与——node 层 AEAD 开壳后喂
+            // ObserveNode；未接线时 Type=7 到这里静默丢弃
+            FrameType::Receipt => None,
         }
     }
 

@@ -14,6 +14,7 @@ members = [
     "src/core/ipv8-hook",
     "src/core/ipv8-compat",
     "src/core/ipv8-fec",
+    "src/core/ipv8-observe",
     "src/core/ipv8-neigh",
     "src/cloud/zoneserver",
     "src/cloud/resolver",
@@ -33,6 +34,7 @@ license = "MIT"
 [workspace.dependencies]
 ipv8-codec = { path = "src/core/ipv8-codec" }
 ipv8-compat = { path = "src/core/ipv8-compat" }
+ipv8-observe = { path = "src/core/ipv8-observe" }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 chacha20poly1305 = "0.10"
