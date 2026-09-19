@@ -18,7 +18,7 @@ IPv8+ 是一个面向广域网的新一代互联网协议实现，提供端到�
 
 ## 快速开始
 
-环境要求：Windows 10/11 x64、Rust stable、.NET 8 SDK、WDK（驱动编译）。
+环境要求：Windows 10/11 x64、Rust stable、.NET 10 SDK、WDK（驱动编译）。
 
 ```powershell
 # 构建协议栈与工具

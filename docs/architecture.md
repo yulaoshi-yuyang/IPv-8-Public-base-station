@@ -30,7 +30,7 @@ wintun 直接跑）、**自由**（钩子判决、规则与路径全部用户态
 4. `dist/driver/` 产物 8 文件齐全（sys/dll/inf/cat/cer/ping8.exe/安装.ps1/卸载.ps1），
    安装脚本装后自动启动（inf 已改 AUTO_START），卸载脚本对称清理。
 5. 用户已决策：**P7b 内核驱动 Attestation 签名（blocked，需真实 EV 证书）**、
-   **P8 邻居双轨收敛 + `node --l2`**（待开工）、**P9 服务化**（待开工）。
+   **P8 邻居双轨收敛 + `node --l2`**（代码已完成，待双机真机验证）、**P9 服务化**（待开工）。
    P7a（自签 EV 工具）已闭环——用户态 .exe/.dll 签名美化 + 跨机信任分发。
    **P9.1 双 exe 拆分已落地**：Cargo 双 bin 同 main.rs，按 exe 文件名（ping8/ipv8adm）
    做命令白名单分割（ping8 禁 l2/driver/hook），见 §6.1。
