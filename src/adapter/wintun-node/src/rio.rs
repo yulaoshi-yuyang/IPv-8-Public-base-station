@@ -30,6 +30,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{
@@ -531,10 +532,15 @@ unsafe impl Send for RioRuntime {}
 unsafe impl Sync for RioRuntime {}
 
 impl RioRuntime {
-    /// 首选规模创建，锁页失败则减半档重试；两档都失败返回错误（交由 Auto 回退）。
+    /// 首选规模创建：自检超时直接失败；锁页类失败则减半档重试；
+    /// 都失败返回错误（交由 Auto 回退）。
     fn create_with_fallback(addr: SocketAddr) -> io::Result<Self> {
         match Self::create(addr, FULL_RECV_SLOTS, FULL_SEND_SLOTS) {
             Ok(rt) => Ok(rt),
+            // 自检超时 = RIO 收发语义在此环境不通，减半槽位不可能改变收发
+            // 结果，重试只是再等一个超时——直接返回触发 std 回退。
+            Err(full) if full.kind() == io::ErrorKind::TimedOut => Err(full),
+            // 其余错误（典型：全量锁页内存不足）才值得用减半槽位兜底。
             Err(full) => match Self::create(addr, SMALL_RECV_SLOTS, SMALL_SEND_SLOTS) {
                 Ok(rt) => {
                     eprintln!(
@@ -953,8 +959,14 @@ impl RioRuntime {
         let target = SocketAddr::new(loopback, bound.port());
         self.send_to(probe, target)?;
 
+        // 超时以墙上时钟为唯一依据，禁止用「轮数 × Sleep(1)」折算时间：
+        // 默认系统时钟粒度约 15.6ms（Hyper-V 虚拟机里 Sleep(1) 常常实睡
+        // ~15ms），固定 2000 轮会膨胀到 ~30s；full/small 两次 create 叠加
+        // ~60s，启动即被卡一分钟，握手与数据面全部推迟。环回探针通常在
+        // send_to 返回后首次 dequeue 立即可见，只有失败路径才走等待。
+        let deadline = Instant::now() + Duration::from_secs(2);
         let mut packets = Vec::new();
-        for _ in 0..2000 {
+        loop {
             packets.clear();
             self.dequeue(&mut packets)?;
             for pkt in packets.drain(..) {
@@ -965,6 +977,10 @@ impl RioRuntime {
                     return Ok(());
                 }
             }
+            if Instant::now() >= deadline {
+                break;
+            }
+            // 让出时间片即可；deadline 兜底，Sleep 的实际粒度不影响超时语义。
             unsafe { Sleep(1) };
         }
         Err(io::Error::new(

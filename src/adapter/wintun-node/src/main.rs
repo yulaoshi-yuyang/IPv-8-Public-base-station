@@ -409,9 +409,11 @@ struct Config {
 fn usage() -> ! {
     eprintln!(
         "用法: ipv8-node --self <32hex> --peer-addr <32hex> --peer-ip <IPv4|IPv6> [--initiate] \
-         [--tun-ip 100.64.0.1] [--tun-prefix 100] [--udp-port 45700] [--peer-port <udp_port>] \
+         [--tun-ip 100.64.0.1] [--tun-prefix 100] [--tun-ipv6 <ula>] [--udp-port 45700] [--peer-port <udp_port>] \
          [--adapter-name IPv8Plus] [--mtu 1432] [--tun-mtu <mtu>=--mtu] [--dll <path>]\n\
          \x20\x20 (--mtu = IPv8+ 分片上限；--tun-mtu 调大 = 整包进 TUN 走分片路径)\n\
+         \x20\x20 # --tun-ipv6（方案 A）：给 TUN 追加 IPv6 地址 + /64 路由（ULA 段，如 fd14::1），\n\
+         \x20\x20 # 仅该段 v6 流量进隧道；不配则 v6 走物理网卡（零回归）。需 --compat 才生成 ICMPv6 差错\n\
          [--learn-peer]\n\
          \x20\x20 # 大内网对端专用：本端被动等对端首帧，把目的地现学为其真实源地址\n\
          \x20\x20 # （对端在 NAT 后预知不到公网映射地址；--peer-ip 传本端自己的地址占位定族）\n\
@@ -499,6 +501,12 @@ fn parse_args_from(argv: &[String]) -> Result<Config, String> {
     let tun_ip = match get("--tun-ip") {
         Some(s) => Ipv4Addr::from_str(&s).map_err(|e| format!("--tun-ip: {e}"))?,
         None => Ipv4Addr::new(100, 64, 0, 1),
+    };
+    // 方案 A：可选 TUN IPv6 地址（ULA 段，前缀固定 /64）。
+    // 提供后 netsh 追加 v6 地址 + 同 /64 路由指向 TUN，仅该段 v6 流量进隧道。
+    let tun_ipv6 = match get("--tun-ipv6") {
+        Some(s) => Some(Ipv6Addr::from_str(&s).map_err(|e| format!("--tun-ipv6: {e}"))?),
+        None => None,
     };
     let udp_port = match get("--udp-port") {
         Some(s) => s.parse().map_err(|_| "--udp-port 非数字".to_string())?,
@@ -693,6 +701,7 @@ fn parse_args_from(argv: &[String]) -> Result<Config, String> {
         nt_size,
         tun_ip,
         netmask,
+        tun_ipv6,
         udp_port,
         peer_port,
         alt,
@@ -925,6 +934,33 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
         adapter.set_address(cfg.tun_ip)?;
         adapter.set_netmask(cfg.netmask)?;
         adapter.set_mtu(cfg.tun_mtu)?;
+        // ---- 方案 A：可选 TUN IPv6（ULA 段 /64）----
+        // wintun crate 0.5 的 set_address 只收 Ipv4Addr；v6 走 netsh 追加，
+        // 不覆盖既有 v4。add 失败（已存在）只 warn 不终止——重启幂等。
+        if let Some(v6) = cfg.tun_ipv6 {
+            let name = &cfg.adapter_name;
+            // /64 网络地址：把低 64 位清零
+            let mut net = [0u8; 16];
+            net[..8].copy_from_slice(&v6.octets()[..8]);
+            let prefix = Ipv6Addr::from(net);
+            for cmd in [
+                // 先删后加，保证重启幂等（地址已存在时 add 会报错）
+                vec!["interface", "ipv6", "delete", "address", name, &v6.to_string()],
+                vec!["interface", "ipv6", "add", "address", name, &format!("{v6}/64")],
+                vec!["interface", "ipv6", "delete", "route", &format!("{prefix}/64"), name],
+                vec!["interface", "ipv6", "add", "route", &format!("{prefix}/64"), name],
+            ] {
+                let out = std::process::Command::new("netsh").args(&cmd).output()?;
+                if !out.status.success() {
+                    tracing::warn!(
+                        cmd = %cmd.join(" "),
+                        stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                        "[tun] netsh ipv6 命令失败（非致命，可能是首次配置）"
+                    );
+                }
+            }
+            println!("[ipv8-node] TUN IPv6: {v6}/64，路由 {prefix}/64 → {name}");
+        }
         Some(Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY)?))
     };
 
@@ -1231,6 +1267,9 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
         effective_mtu: usize,
         /// Phase 3：本机 TUN 地址（ICMP 差错报文源地址）
         tun_ip: Ipv4Addr,
+        /// Phase 3 / 方案 A：本机 TUN IPv6 地址（ICMPv6 差错报文源地址）。
+        /// None = TUN 未配 v6，v6 差错无法合法生成，超大/TTL 归零包静默丢弃。
+        tun_ipv6: Option<Ipv6Addr>,
         /// Phase 3：手动 MSS 钳制值（None = 自动）
         mss_clamp: Option<u16>,
         /// Phase 3：连接迁移（允许从新地址的探测/合法帧持续现学入口）
@@ -1503,16 +1542,15 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
             if self.compat {
                 // PMTU 阈值恒为 effective_mtu；mss_clamp 是最终 MSS 值（不再扣减），
                 // 二者互不污染（F-4）。
-                // TUN 当前只配置 IPv4 地址，故 v6 传 None：v6 差错不生成、
-                // 包直接丢弃（绝不从 :: 发非法 ICMPv6，F-2）。
-                // 未来给 TUN 配置 v6 地址后，把 Some(addr) 传入即可启用。
+                // v6 源地址来自 --tun-ipv6；未配置时 v6 差错无法合法生成，
+                // 超大/TTL 归零包静默丢弃（绝不从 :: 发非法 ICMPv6，F-2）。
                 batch.retain_mut(|bytes| {
                     match process_outbound(
                         bytes,
                         self.effective_mtu,
                         self.mss_clamp,
                         self.tun_ip,
-                        None,
+                        self.tun_ipv6,
                     ) {
                         CompatOutcome::Forward => true,
                         CompatOutcome::InjectIcmp(icmp) => {
@@ -1623,6 +1661,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
         compat: cfg.compat,
         effective_mtu: cfg.mtu.saturating_sub(40),
         tun_ip: cfg.tun_ip,
+        tun_ipv6: cfg.tun_ipv6,
         mss_clamp: cfg.mss_clamp,
         migrate: cfg.migrate,
         mp_alt: if cfg.mp {

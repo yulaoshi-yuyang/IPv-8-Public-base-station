@@ -1,4 +1,4 @@
-﻿# IPv8+ Address Allocation Manager
+# IPv8+ Address Allocation Manager
 # Manages IPv8 address pool, assigns addresses to connecting clients
 
 $allocations = @{}
@@ -333,6 +333,7 @@ server_udp_port = 45700
 
 client_ipv8 = $($alloc.ipv8_address)
 client_tun_ip = $($alloc.tun_ip)
+client_tun_ipv6 = fd14::$($($alloc.tun_ip -split '\.')[-1])
 client_tun_prefix = 10
 
 adapter_name = IPv8Plus
@@ -358,6 +359,10 @@ function Build-ClientLauncher {
     
     # Server address is fb14:...000a... (server = node A)
     $peerHex = "0000fb140000000a0001000001000000"
+    
+    # TUN IPv6 (ULA fd14::/64) 与 tun_ip 末位一一对应，老 allocation 文件
+    # 没有 tun_ipv6 字段也能工作：tun_ip 始终存在。例：100.64.0.12 -> fd14::12
+    $tunIpv6 = 'fd14::' + (($alloc.tun_ip -split '\.')[-1])
     
     $psScript = @"
 # IPv8+ Auto-Connect Client
@@ -385,6 +390,7 @@ Write-Host "=== IPv8+ Client Starting ===" -ForegroundColor Cyan
 Write-Host "Server: $serverIPv6 (ipv8.yulaoshi.xyz)" -ForegroundColor Green
 Write-Host "Your IPv8: $($alloc.ipv8_compact)" -ForegroundColor Green
 Write-Host "Your TUN IP: $($alloc.tun_ip)" -ForegroundColor Green
+Write-Host "Your TUN IPv6: $tunIpv6" -ForegroundColor Green
 Write-Host ""
 
 # Copy wintun.dll if missing
@@ -405,6 +411,7 @@ New-NetFirewallRule -Name "IPv8Plus-Client" -DisplayName "IPv8+ Client UDP 45700
     '--peer-port', '45700',
     '--udp-port', '45700',
     '--tun-ip', '$($alloc.tun_ip)',
+    '--tun-ipv6', '$tunIpv6',
     '--tun-prefix', '10',
     '--adapter-name', 'IPv8Plus',
     '--initiate',
