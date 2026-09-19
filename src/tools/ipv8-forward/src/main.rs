@@ -11,7 +11,7 @@
 //! - 支持转发到 IPv8 地址（通过隧道）或普通 IP:端口
 //!
 //! 用法：
-//!   ipv8-forward --rules firewall.json [--bind 0.0.0.0]
+//!   ipv8-forward --rules firewall.json [--bind 0.0.0.0] [--peer-tun-ip 100.64.0.2]
 //!   ipv8-forward --rules firewall.json --bind 0.0.0.0 --stats-port 9100
 
 use std::collections::HashMap;
@@ -58,6 +58,9 @@ struct Forwarder {
     rules: Arc<RwLock<RuleSet>>,
     stats: Arc<ForwarderStats>,
     bind_addr: String,
+    /// 对端 TUN IP（IPv4 或 IPv6）。规则指定 IPv8 目标时，转发到此 IP:端口。
+    /// 在 1:1 隧道架构下，所有 TUN 流量都发到唯一对端，IPv8 目标即对端。
+    peer_tun_ip: Option<String>,
 }
 
 impl Forwarder {
@@ -90,8 +93,9 @@ impl Forwarder {
                 let rules = self.rules.clone();
                 let stats = self.stats.clone();
                 let rule_id = rule.id.clone();
+                let peer_tun_ip = self.peer_tun_ip.clone();
                 tasks.push(tokio::spawn(async move {
-                    listen_tcp(addr, rules, stats, rule_id).await;
+                    listen_tcp(addr, rules, stats, rule_id, peer_tun_ip).await;
                 }));
             }
         }
@@ -103,8 +107,9 @@ impl Forwarder {
                 let rules = self.rules.clone();
                 let stats = self.stats.clone();
                 let rule_id = rule.id.clone();
+                let peer_tun_ip = self.peer_tun_ip.clone();
                 tasks.push(tokio::spawn(async move {
-                    listen_udp(addr, rules, stats, rule_id).await;
+                    listen_udp(addr, rules, stats, rule_id, peer_tun_ip).await;
                 }));
             }
         }
@@ -122,6 +127,7 @@ async fn listen_tcp(
     rules: Arc<RwLock<RuleSet>>,
     stats: Arc<ForwarderStats>,
     default_rule_id: String,
+    peer_tun_ip: Option<String>,
 ) {
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => {
@@ -146,6 +152,7 @@ async fn listen_tcp(
         let rules = rules.clone();
         let stats = stats.clone();
         let default_rule_id = default_rule_id.clone();
+        let peer_tun_ip = peer_tun_ip.clone();
 
         tokio::spawn(async move {
             stats.connections.fetch_add(1, Ordering::Relaxed);
@@ -186,12 +193,18 @@ async fn listen_tcp(
 
             // 建立到目标的连接
             let upstream = if let Some(_ipv8_addr) = target_addr {
-                // IPv8 地址 → 通过隧道转发（当前版本回退到本地）
-                // TODO: 集成隧道引擎
-                match TcpStream::connect(format!("127.0.0.1:{}", target_port)).await {
+                // IPv8 目标 → 通过隧道转发到对端 TUN IP:端口。
+                // 1:1 隧道架构下所有 TUN 流量发到唯一对端，故连对端 TUN IP 即可。
+                let dst_ip = peer_tun_ip.as_deref().unwrap_or("127.0.0.1");
+                if peer_tun_ip.is_none() {
+                    tracing::warn!(
+                        "规则指定 IPv8 目标但未传 --peer-tun-ip，回退到本地 127.0.0.1"
+                    );
+                }
+                match TcpStream::connect(format!("{dst_ip}:{target_port}")).await {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::warn!("连接目标失败: {}", e);
+                        tracing::warn!("连接对端 {dst_ip}:{target_port} 失败: {e}");
                         stats.active.fetch_sub(1, Ordering::Relaxed);
                         return;
                     }
@@ -257,6 +270,7 @@ async fn listen_udp(
     rules: Arc<RwLock<RuleSet>>,
     stats: Arc<ForwarderStats>,
     default_rule_id: String,
+    peer_tun_ip: Option<String>,
 ) {
     let sock = match UdpSocket::bind(&addr).await {
         Ok(s) => {
@@ -302,6 +316,7 @@ async fn listen_udp(
             continue;
         }
 
+        let target_addr = match_result.as_ref().and_then(|m| m.target);
         let target_port = match_result
             .as_ref()
             .map(|m| m.target_port)
@@ -311,7 +326,13 @@ async fn listen_udp(
         let upstream = if let Some(route) = routes.get(&src) {
             route.clone()
         } else {
-            let upstream_addr = format!("127.0.0.1:{}", target_port);
+            // IPv8 目标 → 对端 TUN IP；无目标 → 本地同端口
+            let dst_ip = if target_addr.is_some() {
+                peer_tun_ip.as_deref().unwrap_or("127.0.0.1")
+            } else {
+                "127.0.0.1"
+            };
+            let upstream_addr = format!("{dst_ip}:{target_port}");
             match UdpSocket::bind("0.0.0.0:0").await {
                 Ok(s) => {
                     let s = Arc::new(s);
@@ -398,6 +419,7 @@ fn print_usage() {
     eprintln!("  --bind <addr>      绑定地址 (默认: 0.0.0.0)");
     eprintln!("  --stats-port <n>   统计服务端口 (默认: 9100)");
     eprintln!("  --watch             监视规则文件变化并自动重载");
+    eprintln!("  --peer-tun-ip <ip>  对端 TUN IP，IPv8 目标转发到此 IP:端口");
     eprintln!();
     eprintln!("规则 JSON 格式:");
     eprintln!(r#"  {{"rules":[{{"id":"r1","name":"Web","protocol":"tcp","port_start":80,"port_end":80,"source_pattern":"","target_addr":"","target_port":0,"enabled":true,"direction":"inbound","comment":""}}]}}"#);
@@ -416,6 +438,7 @@ fn main() {
     let mut bind = "0.0.0.0".to_string();
     let mut stats_port: u16 = 9100;
     let mut watch = false;
+    let mut peer_tun_ip: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -441,6 +464,12 @@ fn main() {
                 }
             }
             "--watch" => watch = true,
+            "--peer-tun-ip" => {
+                i += 1;
+                if i < args.len() {
+                    peer_tun_ip = Some(args[i].clone());
+                }
+            }
             "--help" | "-h" => {
                 print_usage();
                 return;
@@ -499,6 +528,7 @@ fn main() {
         rules,
         stats,
         bind_addr: bind,
+        peer_tun_ip,
     };
     rt.block_on(forwarder.run());
 }
