@@ -622,6 +622,8 @@ fn test_latency(server: SocketAddr) {
     let p50 = rtts[rtts.len() / 2];
     let p95_idx = ((rtts.len() as f64) * 0.95) as usize;
     let p95 = rtts[p95_idx.min(rtts.len() - 1)];
+    let p99_idx = ((rtts.len() as f64) * 0.99) as usize;
+    let p99 = rtts[p99_idx.min(rtts.len() - 1)];
     let jitter = if rtts.len() > 1 {
         let mut diffs = Vec::new();
         for i in 1..rtts.len() {
@@ -637,6 +639,7 @@ fn test_latency(server: SocketAddr) {
     println!("  │  平均: {:.2} ms", avg / 1000.0);
     println!("  │  P50:  {:.2} ms", p50 as f64 / 1000.0);
     println!("  │  P95:  {:.2} ms", p95 as f64 / 1000.0);
+    println!("  │  P99:  {:.2} ms", p99 as f64 / 1000.0);
     println!("  │  抖动: {:.2} ms", jitter / 1000.0);
     println!("  │  超时: {timeouts}/{total}");
     println!("  └─────────────────────────────────────────┘");

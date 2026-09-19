@@ -17,5 +17,4 @@ rand_core = { workspace = true }
 hmac = "0.12"
 
 [dev-dependencies]
-ed25519-dalek = { workspace = true }
 ipv8-qos = { path = "../ipv8-qos" }
