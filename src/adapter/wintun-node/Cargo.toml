@@ -19,6 +19,7 @@ ipv8-grpc = { path = "../../core/ipv8-grpc" }
 ipv8-zoneserver = { path = "../../cloud/zoneserver" }
 ipv8-resolver = { path = "../../cloud/resolver" }
 wintun = "0.5.1"
+sha2 = { workspace = true }
 # Phase 2 RIO 数据面：仅用 Winsock/Foundation/Threading FFI
 # （0.52 已在 lock 中，随 wintun 传递引入；CreateEventW/Sleep/
 # WaitForMultipleObjects/INFINITE 在 0.52 里归 Win32_System_Threading）

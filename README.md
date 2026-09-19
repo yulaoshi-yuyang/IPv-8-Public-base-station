@@ -18,7 +18,7 @@ IPv8+ 是一个面向广域网的新一代互联网协议实现，提供端到�
 
 ## 快速开始
 
-环境要求：Windows 10/11 x64、Rust stable、.NET 10 SDK、WDK（驱动编译）。
+环境要求：Windows 10/11 x64、Rust stable、WDK（驱动编译）。
 
 ```powershell
 # 构建协议栈与工具
@@ -36,9 +36,8 @@ powershell -ExecutionPolicy Bypass -File deploy/client/setup-ipv8-full.ps1
 ## 目录地图
 
 - `src/core/` — IPv8+ 协议栈（编解码、路由、QoS、隧道、加密、钩子、FEC、邻居发现）
-- `src/adapter/` — 虚拟网卡适配器（wintun 节点 Rust 实现）
+- `src/adapter/` — wintun 虚拟网卡节点（Rust 单二进制，wintun.dll 内嵌释放）
 - `src/cloud/` — 云端服务（ANS 分配、DNS 解析、区域服务器）
-- `src/services/` — C# 主机服务（Agent Mesh、QoS 管理、NRPT 清理）
 - `src/driver/` — Windows NDIS 协议驱动（ipv8proto.sys）与属性页 DLL
 - `src/tools/` — 命令行工具（ping8、转发、压测、ws-node）
 - `deploy/` — 部署脚本与客户端资源（wintun、防火墙、NRPT、门户 UI）

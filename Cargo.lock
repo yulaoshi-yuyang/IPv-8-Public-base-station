@@ -980,6 +980,7 @@ dependencies = [
  "ipv8-resolver",
  "ipv8-tunnel",
  "ipv8-zoneserver",
+ "sha2",
  "tokio",
  "tokio-stream",
  "tonic",

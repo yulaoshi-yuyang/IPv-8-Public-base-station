@@ -5,12 +5,14 @@
 //!
 //! 目的只有一个：复现 v9 Phase 1 验收——"两台 Hyper-V VM 通过 wintun
 //! 收发第一个 IPv8+ 包"。用 `ping 100.64.x.y` 即可驱动 ICMP 进隧道。
-//! 生产路径仍是 C# Host + gRPC（tunnel.proto）；本二进制不替代它。
+//! 产品路径即本二进制：单文件分发，wintun.dll 编译期内嵌、首次运行释放
+//! （见 dll_bootstrap）；NDIS L2 仅 P8 开发/高级场景使用。
 //!
 //! 运行前提：管理员权限；UDP 端口放行入站；Phase 1 验证用静态对端配置，
 //! 不依赖云端 Resolver。身份密钥每次启动随机（连通性验证够用；
 //! Phase 2 接 ZoneServer 证书 + --cert-cache 持久化：重启离线验签命中即免注册）。
 
+mod dll_bootstrap;
 mod rio;
 
 use std::error::Error;
@@ -557,9 +559,8 @@ fn parse_args_from(argv: &[String]) -> Result<Config, String> {
                 Some(p) if p.exists() => p,
                 // --no-tun 全程不加载 wintun，缺 dll 合法（零驱动模式的立身之本）
                 _ if argv.iter().any(|a| a == "--no-tun") => PathBuf::from("(unused-no-tun)"),
-                _ => {
-                    return Err("找不到 wintun.dll：用 --dll 指定或放到 exe 同目录".to_string())
-                }
+                // 单文件分发：没有外置 dll 时，释放编译期内嵌的官方签名副本
+                _ => dll_bootstrap::ensure_embedded_dll()?,
             }
         }
     };

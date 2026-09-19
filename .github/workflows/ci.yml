@@ -1,8 +1,7 @@
 name: CI
 
-# Strata (IPv8+) 质量门禁自动化（对应 CONTRIBUTING 第 3 节 / 性能报告改进项「CI/CD 缺失」）。
-# 客户端依赖 wintun / NRPT / .NET AspNetCore shared framework，且 core 里 ipv8-wintun-node、
-# ws-node 等成员只能在 Windows 上编译，故统一用 windows-latest runner。
+# IPv8+ 质量门禁自动化。
+# wintun-node、ws-node 等成员只能在 Windows 上编译，故统一用 windows-latest runner。
 
 on:
   push:
@@ -35,20 +34,3 @@ jobs:
 
       - name: 单元测试
         run: cargo test --workspace
-
-  csharp:
-    name: C# 服务层（build + 契约测试）
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: 安装 .NET 10 SDK
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "10.0.x"
-
-      - name: 构建（0 警告 0 错误；csproj 已开 TreatWarningsAsErrors）
-        run: dotnet build IPv8Plus.slnx --configuration Release
-
-      - name: 服务层契约测试（退出码 = 失败数）
-        run: dotnet run --project tests/services/IPv8Plus.Services.Tests --configuration Release
