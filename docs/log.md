@@ -3,6 +3,7 @@
 散落的想法先记这里，不许开新文件。超 300 行归档为 docs/archive/YYYY-MM.md。
 
 ## 2026-09-19
+- 实验田 exp/ula-overlay（用户点名豁免 48h，不进 main）：mesh 内虚拟 IPv6 寻址。`--ula <net-id>` 默认关闭，与 --tun-ipv6 互斥。派生规则：/48 前缀=SHA-256("ipv8-ula-prefix:"‖net_id) 前 5B 首字节强制 0xfd（哈希派生禁手拍，防撞用户本地 ULA）；节点 IID=SHA-256("ipv8-ula-iid:"‖net_id‖节点16B线格式) 前 8B 清 U/L 位；全网同落 前缀::/64，TUN 仅加精确 /64 路由（红线：无 ::/0、不碰物理网卡 RA、公网 v6 路径原样）。设计决策：「节点公钥」哈希输入用 --self 16B 线格式（Identity::generate() 每次重启随机，违反稳定身份）。改动仅 main.rs（派生结果并入 tun_ipv6 字段，netsh/compat 下游零感知，零跨 crate）。新增 5 单测；clippy -D warnings + cargo test --workspace 全绿（44 套件 0 失败，含 e2e_loopback）。待真机双机验收：netsh show route 无 ::/0 泄漏、curl -6 出口不变、tracert 首跳物理网关、双端 ping 对方 ULA 经隧道。
 - 三层楼重构完工：删 C# 栈平行宇宙（含 CI dotnet job）；wintun.dll 内嵌自举（dll_bootstrap.rs，释放/校验/幂等/自愈四项运行时验证通过）；cross-verify 认定生成目录（doctor.ps1 归 scripts，.gitignore）；根 README 重写为产品路径+P8 开发路径；9 个模块 README、ADR 0001、债务 4 笔登记；architecture.md（编制外 506 行）分诊后删除，活引用改道。全量 clippy -D warnings + cargo test 0 failed。
 - 运营商设备嵌入需求入停车场。验证：核心 10 crate（codec/compat/fec/neigh/firewall/hook/routing/qos/tunnel/ffi）对 x86_64-unknown-linux-gnu cargo check 全过，核心栈零 Windows 依赖；平台特定代码隔离在 adapter/tools。
 - --mp 熔断对抗评审（并入停车场条目，裁决日 2026-09-21）：①误熔断/该熔未熔成本不对称——丢冗余保护（高）vs 白耗一份带宽（低），阈值显著偏向不熔断；②滞回成对：触发=持续 N 窗口无回包，恢复=连续 M 次正常且恢复门槛严格高于触发（两者量纲不同，不可直接比数值，本意是"恢复更难"）；③可测性前置件（grep 证实）：外层数据面无逐包 ACK/回执，仅 ping8→门户 60s 与节点→resolver 20s 心跳，均与 alt 路径无关——探针/回执机制先于阈值设计，否则触发与恢复都无法测量。FEC 自适应启停同步入停车场：不对称性与 --mp 相反（恒开成本有界：25% 带宽+组帧等待延迟，且永不产生坏数据），动态门控优先级更低。

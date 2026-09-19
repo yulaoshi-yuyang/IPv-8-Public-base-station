@@ -331,7 +331,12 @@ struct Config {
     netmask: Ipv4Addr, // 默认 /10 = CGNAT 空间（spec §7.9 / ADR-015）
     /// TUN IPv6 地址（方案 A：ULA 段，如 fd14::1/64）。None = 不给 TUN 配 v6，
     /// v6 流量走物理网卡不进隧道（与现有 v4 零回归对称）。
+    /// `--ula` 派生模式下由此字段承载派生结果，下游（netsh/compat）零感知。
     tun_ipv6: Option<Ipv6Addr>,
+    /// 实验田 `--ula <net-id>`：派生 ULA 寻址（地址 = HASH(网络 ID, 节点身份)，
+    /// 零租约零协议）。默认关闭；与 --tun-ipv6（手工 ULA）互斥。仅作模式标记
+    /// 与日志，派生结果已并入 tun_ipv6。
+    ula_net_id: Option<String>,
     udp_port: u16,
     peer_port: u16,
     /// 备用隧道入口（--alt-ip/--alt-port）：主入口握手失败后 FallbackManager 级联至此。
@@ -416,6 +421,10 @@ fn usage() -> ! {
          \x20\x20 (--mtu = IPv8+ 分片上限；--tun-mtu 调大 = 整包进 TUN 走分片路径)\n\
          \x20\x20 # --tun-ipv6（方案 A）：给 TUN 追加 IPv6 地址 + /64 路由（ULA 段，如 fd14::1），\n\
          \x20\x20 # 仅该段 v6 流量进隧道；不配则 v6 走物理网卡（零回归）。需 --compat 才生成 ICMPv6 差错\n\
+         [--ula <net-id>]\n\
+         \x20\x20 # 实验田：派生 ULA 寻址。/48 前缀 = SHA-256(网络 ID)，节点 IID = SHA-256(网络 ID,\n\
+         \x20\x20 # 节点身份)，全网同前缀同 /64，零租约零协议。默认关闭；与 --tun-ipv6 互斥。\n\
+         \x20\x20 # TUN 只加精确 /64 路由，永不接管 ::/0（公网 v6 上网路径原样保留）\n\
          [--learn-peer]\n\
          \x20\x20 # 大内网对端专用：本端被动等对端首帧，把目的地现学为其真实源地址\n\
          \x20\x20 # （对端在 NAT 后预知不到公网映射地址；--peer-ip 传本端自己的地址占位定族）\n\
@@ -470,6 +479,34 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
+/// ULA 派生寻址（实验田 `--ula`）：地址 = HASH(网络 ID, 节点身份)，零租约、零续约协议。
+///
+/// - /48 前缀 = SHA-256("ipv8-ula-prefix:" ‖ net_id) 前 5 字节，首字节强制 0xfd
+///   （RFC 4193 ULA 空间；哈希派生替代手拍固定段，防与用户本地 ULA 撞车）
+/// - 节点 IID = SHA-256("ipv8-ula-iid:" ‖ net_id ‖ 节点 16B 线格式) 前 8 字节，
+///   清 U/L 位（0x02）标记本地范围（非全局申请，RFC 4193 §3.2.1）
+/// - 全网节点同落 前缀::/64（subnet=0），TUN 只需 on-link /64 路由，机制与方案 A 一致
+fn derive_ula(net_id: &str, node: [u8; 16]) -> Ipv6Addr {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"ipv8-ula-prefix:");
+    h.update(net_id.as_bytes());
+    let ph = h.finalize();
+    let mut oct = [0u8; 16];
+    oct[0] = 0xfd;
+    oct[1..6].copy_from_slice(&ph[..5]);
+    let mut h = Sha256::new();
+    h.update(b"ipv8-ula-iid:");
+    h.update(net_id.as_bytes());
+    h.update(node);
+    let ih = h.finalize();
+    let mut iid = [0u8; 8];
+    iid.copy_from_slice(&ih[..8]);
+    iid[0] &= !0x02;
+    oct[8..16].copy_from_slice(&iid);
+    Ipv6Addr::from(oct)
+}
+
 fn parse_args() -> Result<Config, String> {
     parse_args_from(&std::env::args().skip(1).collect::<Vec<String>>())
 }
@@ -506,9 +543,19 @@ fn parse_args_from(argv: &[String]) -> Result<Config, String> {
     };
     // 方案 A：可选 TUN IPv6 地址（ULA 段，前缀固定 /64）。
     // 提供后 netsh 追加 v6 地址 + 同 /64 路由指向 TUN，仅该段 v6 流量进隧道。
-    let tun_ipv6 = match get("--tun-ipv6") {
+    let tun_ipv6_manual = match get("--tun-ipv6") {
         Some(s) => Some(Ipv6Addr::from_str(&s).map_err(|e| format!("--tun-ipv6: {e}"))?),
         None => None,
+    };
+    // 实验田 `--ula <net-id>`：派生 ULA 寻址（见 derive_ula）。默认关闭；
+    // 与 --tun-ipv6 互斥——手工地址与派生地址是两种配址语义，并存必有一头错配。
+    let ula_net_id = get("--ula").filter(|s| !s.trim().is_empty());
+    if ula_net_id.is_some() && tun_ipv6_manual.is_some() {
+        return Err("--ula 与 --tun-ipv6 互斥：派生寻址与手工 ULA 地址不能同时提供".to_string());
+    }
+    let tun_ipv6 = match &ula_net_id {
+        Some(nid) => Some(derive_ula(nid, self_addr.to_bytes())),
+        None => tun_ipv6_manual,
     };
     let udp_port = match get("--udp-port") {
         Some(s) => s.parse().map_err(|_| "--udp-port 非数字".to_string())?,
@@ -703,6 +750,7 @@ fn parse_args_from(argv: &[String]) -> Result<Config, String> {
         tun_ip,
         netmask,
         tun_ipv6,
+        ula_net_id,
         udp_port,
         peer_port,
         alt,
@@ -960,7 +1008,12 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
                     );
                 }
             }
-            println!("[ipv8-node] TUN IPv6: {v6}/64，路由 {prefix}/64 → {name}");
+            let mode = if cfg.ula_net_id.is_some() {
+                "派生 --ula"
+            } else {
+                "手工 --tun-ipv6"
+            };
+            println!("[ipv8-node] TUN IPv6（{mode}）: {v6}/64，路由 {prefix}/64 → {name}");
         }
         Some(Arc::new(adapter.start_session(wintun::MAX_RING_CAPACITY)?))
     };
@@ -2508,6 +2561,62 @@ mod tests {
             .expect("下界合法")
             .fec_k
             == 2);
+    }
+
+    #[test]
+    fn ula_parse_default_off() {
+        // 不给 --ula：v6 配置为空（零回归基线）
+        let c = parse_args_from(&p4_argv(&[])).expect("最小参数必须可解析");
+        assert!(c.tun_ipv6.is_none() && c.ula_net_id.is_none());
+    }
+
+    #[test]
+    fn ula_parse_mutex_with_manual() {
+        assert!(parse_args_from(&p4_argv(&[
+            "--ula",
+            "test-net",
+            "--tun-ipv6",
+            "fd14::1"
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn ula_derived_is_deterministic_and_in_shared_64() {
+        let nid = "test-net";
+        let a = addr(1).to_bytes();
+        let b = addr(2).to_bytes();
+        let ua = derive_ula(nid, a);
+        let ua2 = derive_ula(nid, a);
+        let ub = derive_ula(nid, b);
+        // 确定性：同输入同地址（零租约的前提）
+        assert_eq!(ua, ua2);
+        // ULA 空间：首字节强制 0xfd（RFC 4193）
+        assert_eq!(ua.octets()[0], 0xfd);
+        // 同前缀 /48：全网同段（节点身份只影响 IID）
+        assert_eq!(&ua.octets()[..6], &ub.octets()[..6]);
+        // 同 /64：subnet=0，on-link 路由一条覆盖全网
+        assert_eq!(&ua.octets()[..8], &ub.octets()[..8]);
+        // 不同节点身份 → 不同 IID
+        assert_ne!(&ua.octets()[8..], &ub.octets()[8..]);
+        // 换网络 ID → 前缀变（隔离性）
+        assert_ne!(&ua.octets()[..6], &derive_ula("other-net", a).octets()[..6]);
+        // U/L 位清零（本地范围标记）
+        assert_eq!(ua.octets()[8] & 0x02, 0);
+    }
+
+    #[test]
+    fn ula_parse_fills_tun_ipv6() {
+        let c = parse_args_from(&p4_argv(&["--ula", "test-net"]))
+            .expect("--ula 合法");
+        assert_eq!(c.ula_net_id.as_deref(), Some("test-net"));
+        // 期望值从 p4_argv 的 --self 字符串独立走一遍 字符串→解析→线格式 路径
+        let node = IPv8Address::from_canonical_str("fb140000000000010001000000010000")
+            .expect("测试常量必合法");
+        assert_eq!(c.tun_ipv6, Some(derive_ula("test-net", node.to_bytes())));
+        // 空白 net-id 视为未提供（防手滑开不出模式）
+        let c2 = parse_args_from(&p4_argv(&["--ula", "  "])).expect("空白仍可解析");
+        assert!(c2.ula_net_id.is_none() && c2.tun_ipv6.is_none());
     }
 
     #[test]
