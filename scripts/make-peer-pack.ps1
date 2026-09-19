@@ -54,7 +54,7 @@ Copy-Item -LiteralPath (Join-Path $rel 'ipv8-node.exe')       -Destination (Join
 Copy-Item -LiteralPath (Join-Path $rel 'ipv8-zoneserver.exe') -Destination (Join-Path $pack 'ipv8-zoneserver.exe') -Force
 Copy-Item -LiteralPath (Join-Path $root 'scripts\verify-cross.ps1')   -Destination (Join-Path $pack 'verify-cross.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $root 'scripts\notun-selftest.ps1') -Destination (Join-Path $pack 'notun-selftest.ps1') -Force
-# doctor.ps1 exists only inside the pack (pack-local triage tool) - leave it as is.
+Copy-Item -LiteralPath (Join-Path $root 'scripts\doctor.ps1') -Destination (Join-Path $pack 'doctor.ps1') -Force
 # wintun.dll: keep the pack copy in sync with the authoritative deploy\client copy.
 Copy-Item -LiteralPath (Join-Path $root 'deploy\client\wintun.dll') -Destination (Join-Path $pack 'wintun.dll') -Force
 

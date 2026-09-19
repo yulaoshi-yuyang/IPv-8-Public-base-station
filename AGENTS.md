@@ -79,7 +79,8 @@
 
 12. 文档编制与自动整合
 - 固定编制，超编即 bug：AGENTS.md / README.md / docs/charter.md /
-  docs/parking-lot.md / docs/dependencies.md / docs/log.md / 每模块 README
+  docs/parking-lot.md / docs/dependencies.md / docs/log.md / docs/debt.md /
+  docs/adr/ / 每模块 README
 - 编制之外每多一个 .md = 一个 bug，本次 commit 内合并或删除
 - 运行日志只准 docs/log.md 一个文件，散落的想法先记这里，不许开新文件
 - log.md 超 300 行 → 归档为 docs/archive/YYYY-MM.md，原文件清空重写

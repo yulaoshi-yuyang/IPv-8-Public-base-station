@@ -440,7 +440,7 @@ fn usage() -> ! {
          \x20\x20 # Phase 2 Registered I/O 极速数据面（默认 auto：能力探测，失败自动回退 std）\n\
          [--hook [127.0.0.1:45810] --hook-timeout 50 --hook-policy accept|drop --hook-payload 128]\n\
          \x20\x20 # 外部判决钩子：把每个内层包以 NDJSON 推给本机程序判决 accept/drop。\n\
-         \x20\x20 # 默认 fail-open；观察者可只录像不判决。协议见 docs/architecture.md §4\n\
+         \x20\x20 # 默认 fail-open；观察者可只录像不判决。协议见 src/core/ipv8-hook/README.md\n\
          [--compat [--mss-clamp <mss>]]\n\
          \x20\x20 # Phase 3 兼容性（默认关闭=零回归）：TTL 扣减（traceroute 可见）、\n\
          \x20\x20 # DF 大包回 ICMP 需要分片、TCP SYN/SYN-ACK MSS 自动钳制到隧道 MTU、\n\

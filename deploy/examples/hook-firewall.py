@@ -19,7 +19,7 @@ IPv8+ 外挂防火墙示例（无第三方依赖，Python 3.8+）
     3. 其余放行，并用 ttl_ms 把"流的首包判决"卸载给节点（5 秒内同流零 IPC）
 
 写你自己的防火墙只需改 decide() —— 能连本地 socket 就能定义网络规则，
-不需要驱动、不需要内核知识。协议见 docs/architecture.md §4。
+不需要驱动、不需要内核知识。协议见 src/core/ipv8-hook/README.md。
 """
 
 import json

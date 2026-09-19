@@ -6,4 +6,6 @@
 | 欠了什么 | 为什么欠 | 计划何时还 |
 |---|---|---|
 | ADR 散落在代码注释（ADR-008 ffi 冻结、ADR-024 内核数据面拒绝、ADR-026 打洞编排），`docs/adr/` 目录未建立 | 决策当时写进了代码注释，未抽成正式 ADR 文件 | 下次涉及这些决策的改动时，先补对应 ADR 再动刀 |
-| P8 `--l2` 代码已完成（wintun-node L2Io + rio.rs），未双机真机验证 | 代码落地后优先推进了 IPv6 双栈与启动脚本，P8 验收延后 | 下一个里程碑：Hyper-V 双 VM 按 architecture §8.4 验收表跑通 |
+| P8 `--l2` 代码已完成（wintun-node L2Io + rio.rs），未双机真机验证 | 代码落地后优先推进了 IPv6 双栈与启动脚本，P8 验收延后 | Hyper-V 双 VM 四项：双轨建邻等价 / `--l2` 互通 drop=0 / 不带 `--l2` 零回归 / 未授权 L2 帧不产生状态 |
+| wintun-node `main.rs` 约 2600 行上帝文件：参数解析、TUN 装配、数据面流水线、转发逻辑全在一处 | 阶段验证期以快速接通为先，拆分一直后置；继续膨胀将拖垮理解速度 | 下次"加厚地基"窗口：按职责拆出 config/tun 装配/数据面模块，每拆一步保持测试全绿 |
+| git 索引未同步：`deploy/cross-verify/` 三个脚本仍被追踪，`doctor.ps1` 已搬 `scripts/` 但索引未记改名 | 本机无 git CLI，绝不手改二进制索引；磁盘侧已按生成目录治理完毕 | 首次在装有 git CLI 的机器上执行 `git add -A deploy/cross-verify scripts/doctor.ps1`，让 git 记录删除与改名 |

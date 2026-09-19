@@ -9,8 +9,7 @@
 //! 3. 有 decision 客户端 → NDJSON 事件经环回 TCP 投递，等待 accept/drop，
 //!    超时 / 客户端断线 / 队列拥塞一律立即回退，**绝不阻塞数据面**。
 //!
-//! 线协议见 [`protocol`]；IP 包解析见 [`ip`]。设计与五阶段路线见
-//! `docs/architecture.md` §4。
+//! 线协议见 [`protocol`]；IP 包解析见 [`ip`]；模块导览见本 crate 的 README。
 
 pub mod ip;
 pub mod protocol;
