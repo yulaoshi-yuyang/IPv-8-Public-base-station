@@ -44,7 +44,7 @@ powershell -ExecutionPolicy Bypass -File deploy/client/setup-ipv8-full.ps1
 - `dist/driver/` — 驱动发布产物（sys / inf / cat / 签名证书 / 安装卸载脚本）
 - `docs/` — 架构文档
 - `shared/` — protobuf 协议定义与测试向量
-- `scripts/` — 驱动打包、安装、交叉验证脚本
+- `scripts/` — 驱动打包、安装、交叉验证脚本，构建产物体积检查（check-build-size）与清理（clean-build）
 
 ## 许可证
 

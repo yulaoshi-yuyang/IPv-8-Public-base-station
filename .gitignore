@@ -89,5 +89,7 @@ docs/references/
 
 # Signing certificates and tools (contain private keys)
 代码签名证书制作工具/
+*.pfx
+*.p12
 
 .superpowers/

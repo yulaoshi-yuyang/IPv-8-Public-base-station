@@ -351,10 +351,10 @@ P8 门禁（蓝屏/卡死一票否决）已满足。
 `Pkcs12Builder` + `TripleDes3KeyPkcs12 + SHA1` PBE 导出兼容老 signtool 的 PFX，`.NET X509Store`
 API 静默安装信任链（绕开 certutil 安全确认弹窗）。
 
-**产物**：`d:\代码\IPV 8\代码签名证书制作工具\` 下五个文件 + 项目级 skill `.trae/skills/self-signed-ev-cert/`：
-- `root.cer` 根 CA / `ev.cer` EV 子证书 / `ev.pfx` PFX（密码 ipv8ev）
+**产物**：项目级 skill `.trae/skills/self-signed-ev-cert/`（正本）：
+- `make-ev-cert.ps1` 可重跑生成脚本（pwsh，全自动化闭环）；运行后生成 `root.cer` 根 CA / `ev.cer` EV 子证书 / `ev.pfx` PFX（密码 ipv8ev），证书为生成物不入版本库
 - `install-trust.ps1` 跨机一键信任安装脚本（零弹窗，普通用户可跑）
-- `make-ev-cert.ps1` 可重跑生成脚本（pwsh，全自动化闭环）
+- 2026-09-19 清理：删除根目录临时工具包 `代码签名证书制作工具\`（私钥副本 + makecert/signcode 等遗留 SDK 工具 + ping8 测试 exe）；该目录本就在 .gitignore 内，新版脚本以 skill 为唯一正本
 
 **技术坑与解法**（skill 内已沉淀）：
 | 坑 | 解法 |

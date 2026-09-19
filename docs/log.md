@@ -5,6 +5,7 @@
 ## 2026-09-19
 
 - 删旧版文件：archive\ipv8-ndis-protocol（C 语言驱动原型，24 文件 813KB，README 从未收录）、deploy\portal\logs 9/19 之前全部运行日志与 shots 截图（共约 115 个）。保留当日活跃日志。
+- 边缘项收尾：check-build-size/clean-build 从根目录移入 scripts/ 并锚定仓库根（跨 cwd 可用），README 目录地图补录；删除根目录"代码签名证书制作工具"整包（ev.pfx 私钥副本 + makecert/signcode 遗留 SDK 工具 + ping8 测试 exe，共 30 文件）与 skill 内 3 个生成证书，make-ev-cert.ps1 以 skill 为唯一正本（384 行新版合入），.gitignore 加 *.pfx/*.p12 兜底，architecture.md P7a 同步。
 - 事故复盘：重启后属性页回退旧 UI——根因是 5C 验收只覆盖 System32 未更新 DriverStore 包。修复路径：运行 scripts/driver-pack.ps1 重新打包（会 inf2cat + 签名 + 生成 dist\driver\安装.ps1），再以管理员运行 dist\driver\安装.ps1 重装（脚本会清 DriverStore 旧 oem*.inf 包 + 幽灵 ROOT 设备节点 + 残留服务，再 netcfg 安装）。教训：驱动更新必须走 DriverStore，只拷 System32 不生效。
 - start-ipv8.ps1：隧道段加"cloudflared 退出即重启"循环（3 次/10s 间隔），修开机早期 DNS 未就绪导致隧道起不来
 
