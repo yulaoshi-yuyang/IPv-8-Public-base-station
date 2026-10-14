@@ -20,7 +20,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,7 +29,7 @@ use rio::{RioMode, RioPacket, UdpIo};
 use ipv8_codec::IPv8Address;
 use ipv8_compat::{process_inbound, process_outbound, Outcome as CompatOutcome};
 use ipv8_fec::{FecRx, FecTx};
-use ipv8_observe::{ObserveConfig, ObserveNode, PathId};
+use ipv8_observe::{CcConfig, ObserveConfig, ObserveNode, PathId};
 use ipv8_hook::{Action as HookAction, Direction as HookDirection, HookBus, HookConfig, PacketEvent};
 use ipv8_tunnel::auth::{
     pop_sign, provision, register_pop_message, verify_key_from_seed, Cert, CertAuthority,
@@ -53,6 +53,9 @@ const PEER_KEY: &str = "peer";
 
 /// 弱凭据入口刷新的限速窗：同窗内至多改址一次（防持续伪造源地址长期抢占）
 const ROAM_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// ADR-0002 熔断半开探针：每 ALT_PROBE_INTERVAL 帧往 alt 发 1 帧探针（熔断态）
+const ALT_PROBE_INTERVAL: u64 = 8;
 
 /// 外层 UDP 包发往哪里（由调度状态机 [`Sched`] 决定）
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -394,8 +397,15 @@ struct Config {
     fec: bool,
     /// --fec-k：FEC 组大小（2..=16，默认 4；开销 = 1/K）
     fec_k: usize,
+    /// ADR-0003 --cc：拥塞控制（延迟主导+丢包兜底），保护性限速，默认关闭
+    cc: bool,
+    /// --cc-ceil <kbps>：速率天花板（--cc 时必填且 >0）
+    cc_ceil_kbps: Option<u64>,
     /// Phase 8 --l2：局域网 L2 传输（ipv8proto.sys 0xFB14 裸帧）
     l2: bool,
+    /// 测试专用（ADR-0002 真机验收）：--test-drop-file <path>。每秒读文件得
+    /// 丢包率‰，对入站 Data 帧按 counter 哈希确定性丢包。生产部署禁止使用。
+    test_drop_file: Option<PathBuf>,
 }
 
 fn usage() -> ! {
@@ -451,10 +461,19 @@ fn usage() -> ! {
          \x20\x20 # --fec 前向纠错：每 K 个 DSCP≠0（低延迟标记）的 Data 帧发 1 个 XOR\n\
          \x20\x20 # 恢复帧，单帧丢失免重传。两端建议同开（仅一端开 --fec 时恢复帧被\n\
          \x20\x20 # 对端丢弃，功能退化为纯双发）。--fec-k 组大小 2..=16（默认 4=25% 开销）\n\
+         [--cc --cc-ceil <kbps>]\n\
+         \x20\x20 # ADR-0003 拥塞控制（默认关闭）：延迟主导+丢包兜底，保护性限速\n\
+         \x20\x20 # 防打爆对端队列（守 RTT 预算），不抢满带宽。限速口径=线上总字节\n\
+         \x20\x20 #（main+alt+FEC 恢复帧全计）。--cc-ceil=速率天花板 kbps（必填），\n\
+         \x20\x20 # 起步=ceil/4，RTT 膨胀≥25% 或丢包≥30‰ 乘性降、好窗加性增\n\
          [--l2]\n\
          \x20\x20 # Phase 8 局域网 L2 传输：经 ipv8proto.sys 0xFB14 裸帧收发，\n\
          \x20\x20 # 同子网零路由/零 NAT 开销；两端都需驱动 v0.11+ bound 同网卡\n\
          \x20\x20 # --peer-ip 不再需要（L2 直接用 MAC 通信），但仍需填一个 IP 占位\n\
+         [--test-drop-file <path>]\n\
+         \x20\x20 # 测试专用（实验室真机验收）：每秒读文件得丢包率‰（0..=1000），\n\
+         \x20\x20 # 对入站 Data 帧按 counter 哈希确定性丢包（观测窗之前，语义=网络\n\
+         \x20\x20 # 丢包）；文件缺失/非法=0。生产部署禁止使用\n\
          拓扑: 恰好一端 --initiate（主动），另一端被动等待 Init\n\
          示例(A 机主动): ipv8-node --self fb140000000000010001000000010000 \\\n\
          \x20\x20 --peer-addr fb140000000000010001000000020000 --peer-ip 192.168.1.12 --tun-ip 100.64.0.1 --initiate\n\
@@ -490,6 +509,54 @@ fn derive_ula(net_id: &str, node: [u8; 16]) -> Ipv6Addr {
     iid[0] &= !0x02;
     oct[8..16].copy_from_slice(&iid);
     Ipv6Addr::from(oct)
+}
+
+/// 测试专用丢包注入（--test-drop-file）：每秒轮询一次文件内容（u32，‰），
+/// 由调用方对入站 Data 帧按 [`test_drop_decide`] 判决丢弃。文件缺失/非法=0
+/// （不丢），值钳到 1000。仅实验室真机验收使用，生产部署不得提供该参数。
+struct TestDrop {
+    file: PathBuf,
+    /// (上次读取时刻, 缓存的‰值)；首查强制过期立即读文件
+    cache: Mutex<(std::time::Instant, u32)>,
+}
+
+impl TestDrop {
+    fn new(file: PathBuf) -> Self {
+        Self {
+            file,
+            cache: Mutex::new(
+                (std::time::Instant::now() - std::time::Duration::from_secs(2), 0),
+            ),
+        }
+    }
+
+    /// 当前丢包率‰（距上次读取不足 1s 用缓存，避免每帧一次文件 IO）
+    fn rate(&self) -> u32 {
+        let mut g = self.cache.lock().expect("test-drop");
+        if g.0.elapsed() >= std::time::Duration::from_secs(1) {
+            let v = std::fs::read_to_string(&self.file)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(0)
+                .min(1000);
+            *g = (std::time::Instant::now(), v);
+        }
+        g.1
+    }
+}
+
+/// 确定性丢包判决（纯函数，单测可注入）：Knuth 乘法散列取高 32 位模 1000，
+/// < rate 则丢。必须散布，不能直接 counter%1000——后者把丢包集中成连续
+/// 计数器块，而空洞只计入"恢复到达"那一窗：400pps/200ms 报告窗下每个丢块
+/// 只产生一个高损窗，相邻零损窗清零 high_run，两连高损窗物理上造不出来，
+/// FEC 门控验收必然失败（2026-10-01 双机实测：loss‰=797 仅一窗、门控不开）。
+/// 真实随机丢包近似均匀散布，测试注入应同构。
+/// 保留的关键性质：同 counter 恒同判——--mp 双发的同帧两副本共享 counter
+/// 同判同丢（union 损失精确=rate）；FEC 重建帧同 counter 同判（本模式下
+/// 恢复帧救不回被丢帧，观察到的损失率不被 FEC 稀释，门控验收信号稳定）。
+fn test_drop_decide(counter: u64, rate: u32) -> bool {
+    rate > 0
+        && (counter.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) % 1000 < rate as u64
 }
 
 fn parse_args() -> Result<Config, String> {
@@ -725,6 +792,22 @@ fn parse_args_from(argv: &[String]) -> Result<Config, String> {
         ));
     }
 
+    // ---- ADR-0003：拥塞控制（默认关；--cc 时 --cc-ceil 必填且 >0）----
+    let cc = argv.iter().any(|a| a == "--cc");
+    let cc_ceil_kbps = match get("--cc-ceil") {
+        Some(s) => Some(s.parse().map_err(|_| "--cc-ceil 非数字".to_string())?),
+        None => None,
+    };
+    if cc && cc_ceil_kbps.is_none() {
+        return Err("--cc 需要 --cc-ceil <kbps>（速率天花板，保护性限速以何为界）".to_string());
+    }
+    if !cc && cc_ceil_kbps.is_some() {
+        return Err("--cc-ceil 需要 --cc（未开拥塞控制时天花板无意义）".to_string());
+    }
+    if cc_ceil_kbps == Some(0) {
+        return Err("--cc-ceil 必须 >0".to_string());
+    }
+
     Ok(Config {
         self_addr,
         peer_addr,
@@ -766,7 +849,10 @@ fn parse_args_from(argv: &[String]) -> Result<Config, String> {
         mp,
         fec,
         fec_k,
+        cc,
+        cc_ceil_kbps,
         l2: argv.iter().any(|a| a == "--l2"),
+        test_drop_file: get("--test-drop-file").map(PathBuf::from),
     })
 }
 
@@ -898,10 +984,22 @@ async fn enroll_via_zone(
 async fn main() {
     // 结构化日志：tracing 输出走 stderr，cross-verify 脚本读的 [stats]/Established
     // 等行留在 stdout 不受影响；级别可用 RUST_LOG 环境变量覆盖（默认 info）。
+    // 用 LineWriter 包 stderr：Start-Process -RedirectStandardError 重定向到文件时
+    // stderr 默认块缓冲，硬杀进程丢缓冲导致验收脚本读不到关键日志。
+    struct FlushingErr;
+    impl std::io::Write for FlushingErr {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut e = std::io::stderr();
+            let n = e.write(buf)?;
+            e.flush()?;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> { std::io::stderr().flush() }
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
-        .with_writer(std::io::stderr)
+        .with_writer(std::sync::Mutex::new(FlushingErr))
         .init();
     let cfg = match parse_args() {
         Ok(c) => c,
@@ -1062,7 +1160,16 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
     // Phase 8：--l2 直接走 ipv8proto.sys 0xFB14 裸帧。
     // 三种模式同构：send_to/recv 语义一致，打洞/分片/握手各线程无感知。
     let mode = if cfg.l2 { rio::RioMode::L2 } else { cfg.rio_mode };
-    let udp = UdpIo::bind(bind_addr, mode)?;
+    // L2 多网卡选卡：把对端 underlay IPv4 传进去按同子网挑 bound 卡（v6/无提示回退首张）
+    let l2_peer_v4 = if cfg.l2 {
+        match cfg.peer_ip {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        }
+    } else {
+        None
+    };
+    let udp = UdpIo::bind(bind_addr, mode, l2_peer_v4)?;
     let peer = SocketAddr::new(cfg.peer_ip, cfg.peer_port);
     println!("[ipv8-node] UDP 绑定 {bind_addr}，对端初始 {peer}");
 
@@ -1288,6 +1395,35 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
         rx: Mutex<FecRx>,
     }
 
+    /// ADR-0003 批粒度令牌桶限速器：统计批线上总字节（main+alt+恢复帧全计），
+    /// 批后 sleep 追平。桶容量=50ms 等值字节（吸收 TUN 批突发，又不积压失控）。
+    struct Pacer {
+        tokens: f64,
+        last: std::time::Instant,
+    }
+
+    impl Pacer {
+        fn new() -> Self {
+            Self { tokens: 0.0, last: std::time::Instant::now() }
+        }
+
+        fn wait(&mut self, rate_bps: u64, bytes: u64) {
+            let rate = rate_bps as f64 / 8.0; // B/s
+            let now = std::time::Instant::now();
+            let dt = now.duration_since(self.last).as_secs_f64();
+            self.last = now;
+            let cap = rate * 0.05;
+            self.tokens = (self.tokens + rate * dt).min(cap);
+            self.tokens -= bytes as f64;
+            if self.tokens < 0.0 {
+                let wait_s = -self.tokens / rate;
+                self.tokens = 0.0;
+                std::thread::sleep(std::time::Duration::from_secs_f64(wait_s));
+                self.last = std::time::Instant::now();
+            }
+        }
+    }
+
     struct Plane {
         engine: Arc<Mutex<Engine>>,
         udp: UdpIo,
@@ -1321,6 +1457,20 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
         observe: Arc<Mutex<ObserveNode>>,
         /// 观测时钟锚点：全 Plane 共用同一相对时基（ms 判窗/us 算 RTT）
         clock_anchor: std::time::Instant,
+        /// 上次出站策略（仅用于状态翻转时打一条 info；无流量即无判决可打）
+        last_alt_off: AtomicBool,
+        last_fec_on: AtomicBool,
+        /// ADR-0002 半开探针：熔断态仍按 1/ALT_PROBE_INTERVAL 速率往 alt 发帧，
+        /// 让对端能观测到路径复活（否则停发=对端永远报告 alt 死=自激死锁）
+        alt_probe: AtomicU64,
+        /// 回执摄入诊断计数器（每 N 份打一条 union 丢包率）
+        rx_diag: AtomicU64,
+        /// 回执发送诊断计数器
+        observe_tx_diag: AtomicU64,
+        /// ADR-0003 --cc：批粒度令牌桶限速器；None = 关闭（出站直通，零开销）
+        pacer: Option<Mutex<Pacer>>,
+        /// 测试专用（--test-drop-file）：入站 Data 帧确定性丢包；None = 关闭
+        test_drop: Option<TestDrop>,
     }
 
     impl Plane {
@@ -1379,6 +1529,18 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
             if raw == PUNCH_KNOCK {
                 return;
             }
+            // 测试丢包注入（--test-drop-file）：只丢 Data 帧（Type=2），且在 FEC
+            // 分流/观测窗之前——判决点在观测窗之前 = 对端已盖戳的网络丢包语义。
+            // 回执(Type=7)是观测信道绝不能盲；恢复帧(Type=6)不丢保持 FEC 语义。
+            if let Some(td) = &self.test_drop {
+                if raw.len() >= 2 && raw[0] == 0x01 && raw[1] == 2 {
+                    if let Some((_, counter)) = ipv8_observe::frame_meta(raw) {
+                        if test_drop_decide(counter, td.rate()) {
+                            return;
+                        }
+                    }
+                }
+            }
             // ---- Phase 4 --fec：恢复帧分流 + Data 帧缓存（FR-5）----
             // 必须在 hub/引擎之前：两者都不消费 Type=6（引擎静默丢），不先分流
             // 则恢复帧永远进不了 FecRx。Data 帧 observe 以 AEAD 计数器为键，
@@ -1414,16 +1576,29 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
                     // 回执：主 SA 开壳（与 Data 独立的 nonce/重放空间）后喂观测器。
                     // 锁不嵌套：engine 临时锁语句末释放，再取 observe，避免与
                     // 回执周期线程（observe→engine）构成锁序环。
+                    tracing::info!("[observe] 收到回执帧 len={}", raw.len());
                     let opened = self.engine.lock().expect("engine").open_receipt(raw);
-                    if let Some(report) = opened {
-                        if let Err(e) = self
-                            .observe
-                            .lock()
-                            .expect("observe")
-                            .ingest_report(self.now_ms(), self.now_us(), &report)
-                        {
-                            tracing::debug!(error = ?e, "[observe] 回执拒绝");
+                    match opened {
+                        Some(report) => {
+                            tracing::info!("[observe] 回执开壳成功，喂观测器");
+                            if let Err(e) = self
+                                .observe
+                                .lock()
+                                .expect("observe")
+                                .ingest_report(self.now_ms(), self.now_us(), &report)
+                            {
+                                tracing::debug!(error = ?e, "[observe] 回执拒绝");
+                            }
+                            // 诊断：每 5 份报告(~1s)打一次 union 丢包率与门控态
+                            let n = self.rx_diag.fetch_add(1, Ordering::Relaxed);
+                            if n.is_multiple_of(5) {
+                                let (dunion, fec_on) = self.observe.lock().expect("observe").last_union_delta();
+                                let (de, ds) = dunion;
+                                let loss = de.saturating_sub(ds).saturating_mul(1000).checked_div(de).unwrap_or(0);
+                                tracing::info!("[observe-diag] union expected={de} seen={ds} loss‰={loss} fec_on={fec_on}");
+                            }
                         }
+                        None => tracing::warn!("[observe] 回执开壳失败（AEAD/重放/未建链）"),
                     }
                     return;
                 }
@@ -1668,10 +1843,26 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
                     let mp_alt = self.mp_alt;
                     // ADR-0002：批级读一次出站策略（不进逐包循环取锁）。
                     // alt_disabled=观测熔断（main 活 alt 死透）；fec_on=自适应门控。
-                    let (alt_disabled, fec_on) = {
+                    // ADR-0003：cc_rate=拥塞控制当前限速（None=--cc 关，直通）。
+                    let (alt_disabled, fec_on, cc_rate) = {
                         let ob = self.observe.lock().expect("observe");
-                        (ob.alt_disabled(), ob.fec_enabled())
+                        (ob.alt_disabled(), ob.fec_enabled(), ob.cc_rate_bps())
                     };
+                    // ADR-0002：策略翻转各打一条 info（运维锚点/真机验收判据）
+                    if self.last_alt_off.swap(alt_disabled, Ordering::Relaxed) != alt_disabled {
+                        if alt_disabled {
+                            tracing::info!("[observe] alt 熔断：停发备用路径（main 活、alt 死透 3 窗）");
+                        } else {
+                            tracing::info!("[observe] alt 恢复：连续 5 窗高质量，回双发");
+                        }
+                    }
+                    if self.last_fec_on.swap(fec_on, Ordering::Relaxed) != fec_on {
+                        if fec_on {
+                            tracing::info!("[observe] FEC 门控开启：union 丢包率≥30‰ 持续 2 窗");
+                        } else {
+                            tracing::info!("[observe] FEC 门控关闭：连续 5 窗丢包率≤5‰");
+                        }
+                    }
                     let mut out: Vec<Vec<u8>> = Vec::new();
                     {
                         let mut g = self.engine.lock().expect("engine");
@@ -1706,17 +1897,29 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
                             }
                         }
                     } // 先还 engine 锁，再碰网络
+                    // ADR-0003：本批线上总字节（main+alt+恢复帧全计），批后限速用
+                    let mut wire_bytes = 0u64;
                     for frame in &out {
-                        if let Err(e) = self.udp.send_to(frame, dest) {
-                            tracing::warn!(error = %e, "[udp] send 失败");
+                        match self.udp.send_to(frame, dest) {
+                            Ok(_) => wire_bytes += frame.len() as u64,
+                            Err(e) => tracing::warn!(error = %e, "[udp] send 失败"),
                         }
                         // ADR-0002：熔断期间跳过备用路径（省一份白烧的带宽），
-                        // 5 连高质量窗后自动恢复双发
-                        if let Some(alt) = mp_alt.filter(|_| !alt_disabled) {
-                            if let Err(e) = self.udp.send_to(frame, alt) {
-                                tracing::warn!(error = %e, target = %alt, "[udp] 备用路径 send 失败");
+                        // 但保留 1/8 探针速率让对端能观测路径复活（自激死锁防护）；
+                        // 5 连活窗后自动恢复全量双发。
+                        let probe = self.alt_probe.fetch_add(1, Ordering::Relaxed).is_multiple_of(ALT_PROBE_INTERVAL);
+                        if let Some(alt) = mp_alt.filter(|_| !alt_disabled || probe) {
+                            match self.udp.send_to(frame, alt) {
+                                Ok(_) => wire_bytes += frame.len() as u64,
+                                Err(e) => tracing::warn!(error = %e, target = %alt, "[udp] 备用路径 send 失败"),
                             }
                         }
+                    }
+                    // ADR-0003：批后令牌桶追平（--cc 关时 pacer=None 直通零开销）。
+                    // 已知边界：分片活跃路径（上方 used_shards 提前 return）不经此处，
+                    // 与 mp/fec 一致——性能档下保护性限速让位（见 ADR-0003）。
+                    if let (Some(pacer), Some(rate)) = (&self.pacer, cc_rate) {
+                        pacer.lock().expect("pacer").wait(rate, wire_bytes);
                     }
                 }
                 // 明文级：内层 IP 包原样直发（v9 §11 末两级）
@@ -1773,9 +1976,21 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
         },
         observe: Arc::new(Mutex::new(ObserveNode::new(ObserveConfig {
             dual_path: cfg.mp,
+            cc: if cfg.cc {
+                Some(CcConfig::new(cfg.cc_ceil_kbps.expect("parse 已校验 --cc 必配 ceil") * 1000))
+            } else {
+                None
+            },
             ..Default::default()
         }))),
         clock_anchor: std::time::Instant::now(),
+        last_alt_off: AtomicBool::new(false),
+        last_fec_on: AtomicBool::new(false),
+        alt_probe: AtomicU64::new(0),
+        rx_diag: AtomicU64::new(0),
+        observe_tx_diag: AtomicU64::new(0),
+        pacer: cfg.cc.then(|| Mutex::new(Pacer::new())),
+        test_drop: cfg.test_drop_file.map(TestDrop::new),
     });
 
     /// 单批 TUN 排空上界：wintun 官方 C API 只有单包 Receive/Send，
@@ -1790,8 +2005,15 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
         let plane = plane.clone();
         std::thread::Builder::new()
             .name("observe".into())
-            .spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(50));
+            .spawn(move || {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::File::create("observe-thread-alive.txt") {
+                    let _ = writeln!(f, "observe thread started at {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+                }
+                eprintln!("[observe] 观测线程启动（println 直写 stderr）");
+                tracing::info!("[observe] 观测线程启动");
+                loop {
+                    std::thread::sleep(Duration::from_millis(50));
                 let report = plane
                     .observe
                     .lock()
@@ -1807,7 +2029,11 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
                 let dest = match plane.sched.lock().expect("sched").transport.clone() {
                     Transport::Tunnel(d) | Transport::PlainUdp(d) => d,
                 };
+                if plane.observe_tx_diag.fetch_add(1, Ordering::Relaxed).is_multiple_of(10) {
+                    tracing::info!("[observe] 发送回执帧到 {} len={}", dest, frame.len());
+                }
                 let _ = plane.udp.send_to(&frame, dest);
+                }
             })
             .expect("spawn observe");
     }
@@ -1850,6 +2076,40 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
             }
         });
     }
+
+    // TUN 读线程工厂（v9 §8 铁律：独立 std::thread + 拷贝即 drop）：
+    // 阻塞等到第一包后，非阻塞排空 ring，组批交 Plane 统一封壳出站。
+    // std 与 --l2 两条 underlay 共用——underlay 怎么换都不能少 wintun ring
+    // 的消费者，否则 OS 进环的内层 IP 包永远烂着，sealed 恒 0（P8 真机踩过）。
+    let spawn_tun_reader = |session: Arc<wintun::Session>, plane: Arc<Plane>| {
+        std::thread::spawn(move || loop {
+            let mut batch: Vec<Vec<u8>> = Vec::new();
+            match session.receive_blocking() {
+                Ok(pkt) => {
+                    batch.push(pkt.bytes().to_vec()); // ★ 拷贝出环形缓冲区
+                    drop(pkt); // ★ 立即归还
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "[tun] receive 结束");
+                    break;
+                }
+            }
+            while batch.len() < TUN_BATCH_CAP {
+                match session.try_receive() {
+                    Ok(Some(pkt)) => {
+                        batch.push(pkt.bytes().to_vec());
+                        drop(pkt);
+                    }
+                    Ok(None) => break, // 环空：交还阻塞等待
+                    Err(e) => {
+                        tracing::warn!(error = %e, "[tun] try_receive 结束");
+                        return;
+                    }
+                }
+            }
+            plane.dispatch_tun_batch(batch);
+        })
+    };
 
     if let Some(rt) = udp.as_rio() {
         // ---- RIO 极速数据面：单一事件循环替换 std 模式的 TUN 收线程 + UDP 收线程 ----
@@ -1970,8 +2230,13 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
         });
     } else if let Some(l2) = udp.as_l2() {
         // ---- Phase 8 L2 数据面：ipv8proto.sys 0xFB14 裸帧 ----
-        // 收线程走 L2Io::recv()，塞占位 SocketAddr 给 Plane；
+        // L2 只替换 underlay：收线程走 L2Io::recv()，塞占位 SocketAddr 给 Plane；
         // 发送路径完全复用（UdpIo::send_to 在 L2 分支已走 send_to_mac）。
+        // 但 wintun ring 的消费者不能少：OS 进环的内层 IP 包（ping 等）必须由
+        // 独立 TUN 读线程取出封壳，否则只有 underlay 帧在跑、sealed 恒 0。
+        if let Some(session) = plane.session.clone() {
+            spawn_tun_reader(session, plane.clone());
+        }
         let plane = plane.clone();
         let l2 = l2.clone();
         std::thread::spawn(move || {
@@ -1997,37 +2262,9 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
     } else {
         // ---- std 数据面（--rio off，或 auto 探测失败回退）：行为与 Phase 1 一字不差 ----
 
-        // TUN 读线程（v9 §8 铁律：独立 std::thread + 拷贝即 drop）：
-        // 阻塞等到第一包后，非阻塞排空环形缓冲，组批交 Plane 统一处理。
+        // TUN 读线程（v9 §8 铁律）：与 --l2 共用上面的 spawn_tun_reader 工厂。
         if let Some(session) = plane.session.clone() {
-            let plane = plane.clone();
-            std::thread::spawn(move || loop {
-                let mut batch: Vec<Vec<u8>> = Vec::new();
-                match session.receive_blocking() {
-                    Ok(pkt) => {
-                        batch.push(pkt.bytes().to_vec()); // ★ 拷贝出环形缓冲区
-                        drop(pkt); // ★ 立即归还
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "[tun] receive 结束");
-                        break;
-                    }
-                }
-                while batch.len() < TUN_BATCH_CAP {
-                    match session.try_receive() {
-                        Ok(Some(pkt)) => {
-                            batch.push(pkt.bytes().to_vec());
-                            drop(pkt);
-                        }
-                        Ok(None) => break, // 环空：交还阻塞等待
-                        Err(e) => {
-                            tracing::warn!(error = %e, "[tun] try_receive 结束");
-                            return;
-                        }
-                    }
-                }
-                plane.dispatch_tun_batch(batch);
-            });
+            spawn_tun_reader(session, plane.clone());
         }
 
         // UDP 收线程：recv_from 阻塞取包，交 Plane 统一拆壳/写回 TUN。
@@ -2634,6 +2871,42 @@ mod tests {
             .expect("下界合法")
             .fec_k
             == 2);
+    }
+
+    #[test]
+    fn test_drop_parse_and_decide() {
+        // 默认关闭
+        let c = parse_args_from(&p4_argv(&[])).expect("最小参数必须可解析");
+        assert!(c.test_drop_file.is_none());
+        // 显式提供
+        let c = parse_args_from(&p4_argv(&["--test-drop-file", "C:\\t\\drop.txt"]))
+            .expect("test-drop-file 合法");
+        assert_eq!(c.test_drop_file, Some(PathBuf::from("C:\\t\\drop.txt")));
+        // 判决边界：rate=0 恒不丢；rate=1000 全丢
+        assert!(!test_drop_decide(0, 0));
+        assert!(!test_drop_decide(999, 0));
+        assert!(test_drop_decide(0, 1000));
+        assert!(test_drop_decide(12345, 1000));
+        // 单调性：低 rate 判丢的 counter 在高 rate 下必丢
+        for c in 0..2_000u64 {
+            if test_drop_decide(c, 50) {
+                assert!(test_drop_decide(c, 300));
+            }
+        }
+        // 散布性：300‰ 下 2 万帧丢包比例≈30%（±4σ 界）
+        let drops = (0..20_000u64).filter(|&c| test_drop_decide(c, 300)).count();
+        assert!((5_400..=6_600).contains(&drops), "300‰ 应≈30% 丢弃，实测 {drops}/20000");
+        // 门控可用性（2026-10-01 根因回归锁）：任意 250 连续 counter
+        // （=400pps 下一报告窗）必须同时含丢与达——每个报告窗都观测到
+        // ≈rate 损失，两连高损窗才可达；全丢窗会让 expected 停滞（冻结），
+        // 全达窗会把 high_run 清零。退化取模模式在首个 250 窗即全达。
+        for w in 0u64..40 {
+            let base = w * 250;
+            assert!((base..base + 250).any(|c| test_drop_decide(c, 300)), "窗 {w} 全达");
+            assert!((base..base + 250).any(|c| !test_drop_decide(c, 300)), "窗 {w} 全丢");
+        }
+        // 与退化取模模式必须有差异（防改回 counter%1000 而测试仍绿）
+        assert!((0..10_000u64).any(|c| test_drop_decide(c, 300) != (c % 1000 < 300)));
     }
 
     #[test]

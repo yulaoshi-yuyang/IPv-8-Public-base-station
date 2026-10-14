@@ -3,23 +3,25 @@
 //! 是什么 / 输入 / 输出
 //! - 是什么：纯函数零依赖 crate。入站 Data 帧经稀疏滑动窗统计计数器缺口，
 //!   周期性编码成 124B 回执帧（FrameType=7，由 node 层 AEAD 密封后发出）；
-//!   对端报告经 RTCP 式回显产出 RTT，并驱动两个滞回策略：
-//!   --mp alt 熔断、FEC 自适应门控。
+//!   对端报告经 RTCP 式回显产出 RTT，并驱动两个滞回策略与 ADR-0003 拥塞控制：
+//!   --mp alt 熔断、FEC 自适应门控、--cc 延迟主导丢包兜底限速。
 //! - 输入：①`observe_inbound` 喂原始入站 Data 帧（密文即可，计数器明文在帧尾），
 //!   带路径归属；②`ingest_report` 喂对端回执字节；全部时刻由调用方注入
 //!   （ms 用于年龄/周期，us 用于 RTT；相对时钟即可，跨机只回显不比绝对值）。
 //! - 输出：`maybe_build_report` 周期产出回执字节；`alt_disabled`/`fec_enabled`
-//!   给出站策略；`rtt_us`/`path_counters` 供观测。
+//!   给出站策略；`cc_rate_bps` 给出站限速；`rtt_us`/`path_counters` 供观测。
 
+mod cc;
 mod policy;
 mod report;
 mod rtt;
 mod window;
 
+pub use cc::{CcConfig, CongestionController};
 pub use policy::{Breaker, BreakerConfig, FecGate, GateConfig};
 pub use report::{decode as decode_report, encode as encode_report, Report, ReportError, REPORT_LEN};
 pub use rtt::RttTracker;
-pub use window::{PathCounters, PathState, DATA_MIN_FRAME};
+pub use window::{frame_meta, PathCounters, PathState, DATA_MIN_FRAME};
 
 use window::SaWindows;
 
@@ -39,6 +41,8 @@ pub struct ObserveConfig {
     pub dual_path: bool,
     pub breaker: BreakerConfig,
     pub gate: GateConfig,
+    /// ADR-0003 --cc：拥塞控制配置；None = 关闭（出站直通，零开销）
+    pub cc: Option<CcConfig>,
 }
 
 impl Default for ObserveConfig {
@@ -48,6 +52,7 @@ impl Default for ObserveConfig {
             dual_path: false,
             breaker: BreakerConfig::default(),
             gate: GateConfig::default(),
+            cc: None,
         }
     }
 }
@@ -64,14 +69,19 @@ pub struct ObserveNode {
     last_report_ms: Option<u64>,
     /// 对端上一份报告的快照（做区间差值）
     peer_prev: Option<[PathCounters; report::SLOT_COUNT]>,
+    /// 最近一次推进策略的 union (期望差, 到达差)，诊断用
+    last_dunion: (u64, u64),
     breaker: Breaker,
     gate: FecGate,
+    /// ADR-0003 --cc：拥塞控制器；None = 关闭
+    cc: Option<CongestionController>,
 }
 
 impl ObserveNode {
     pub fn new(cfg: ObserveConfig) -> Self {
         let breaker = Breaker::new(cfg.breaker);
         let gate = FecGate::new(cfg.gate);
+        let cc = cfg.cc.map(CongestionController::new);
         Self {
             cfg,
             rx: [PathState::new(), PathState::new()],
@@ -80,8 +90,10 @@ impl ObserveNode {
             seq: 0,
             last_report_ms: None,
             peer_prev: None,
+            last_dunion: (0, 0),
             breaker,
             gate,
+            cc,
         }
     }
 
@@ -142,21 +154,23 @@ impl ObserveNode {
                 )
             };
             let dmain = delta(&r.slots[report::SLOT_MAIN], &prev[report::SLOT_MAIN]);
-            let dalt = delta(&r.slots[report::SLOT_ALT], &prev[report::SLOT_ALT]);
             let dunion = delta(&r.slots[report::SLOT_UNION], &prev[report::SLOT_UNION]);
             if self.cfg.dual_path {
                 self.breaker.update(
                     &r.slots[report::SLOT_MAIN],
                     &r.slots[report::SLOT_ALT],
-                    dalt,
                 );
             }
             self.gate.update(dunion);
+            self.last_dunion = dunion;
+            // ADR-0003：CC 与门控同源（dunion 丢包‰）+ RTT 回显，同一函数顺手推进
+            if let Some(cc) = &mut self.cc {
+                cc.update(dunion, self.rtt.rtt_us(), now_ms);
+            }
             // 显式标记 dmain 属设计口径（main 活性在 breaker 内按年龄判），防未用警告
             let _ = dmain;
         }
         self.peer_prev = Some(r.slots);
-        let _ = now_ms;
         Ok(())
     }
 
@@ -170,8 +184,18 @@ impl ObserveNode {
         self.gate.enabled()
     }
 
+    /// 诊断：最近一份对端报告的 union 期望/到达差与门控态（真机验收查信号链）
+    pub fn last_union_delta(&self) -> ((u64, u64), bool) {
+        (self.last_dunion, self.gate.enabled())
+    }
+
     pub fn rtt_us(&self) -> Option<u64> {
         self.rtt.rtt_us()
+    }
+
+    /// ADR-0003 --cc：当前限速 bit/s；None = 未启用（出站直通）
+    pub fn cc_rate_bps(&self) -> Option<u64> {
+        self.cc.as_ref().map(CongestionController::rate_bps)
     }
 
     /// 本端入向某路径的累计计数（诊断/测试用）
@@ -184,13 +208,13 @@ impl ObserveNode {
 mod tests {
     use super::*;
 
-    /// 构造 74B Data 帧（计数器明文在帧尾；内容无意义，观测不看载荷）
+    /// 构造 74B Data 帧（计数器在明文段后 offset=50；body[6]=0 无扩展头）
     fn data_frame(counter: u64) -> Vec<u8> {
         let mut f = vec![0u8; DATA_MIN_FRAME];
         f[0] = 1;
         f[1] = 2;
-        let tail = f.len() - 24;
-        f[tail..tail + 8].copy_from_slice(&counter.to_be_bytes());
+        let off = window::FRAME_HEADER_LEN + window::BASE_HEADER_SIZE;
+        f[off..off + 8].copy_from_slice(&counter.to_be_bytes());
         f
     }
 
@@ -242,6 +266,33 @@ mod tests {
             a.ingest_report(now, now * 1000, &rep).unwrap();
         }
         assert!(!a.alt_disabled(), "5 连高质量窗必须恢复双发");
+    }
+
+    #[test]
+    fn cc_none_passes_through_cc_some_advances() {
+        // --cc 关：cc_rate_bps=None
+        let a_off = ObserveNode::new(ObserveConfig::default());
+        assert_eq!(a_off.cc_rate_bps(), None);
+
+        // --cc 开（ceil=8Mbps）：起步=ceil/4=2M
+        let mut cfg = ObserveConfig::default();
+        cfg.cc = Some(CcConfig::new(8_000_000));
+        let mut a_on = ObserveNode::new(cfg);
+        assert_eq!(a_on.cc_rate_bps(), Some(2_000_000));
+
+        // B 端构造报告：首份基线 + 两份零丢包区间 → 加性增两次
+        let mut b = ObserveNode::new(ObserveConfig::default());
+        let r0 = b.maybe_build_report(0, 0).unwrap();
+        a_on.ingest_report(0, 0, &r0).unwrap();
+        for w in 1..=2u64 {
+            let now = w * 200;
+            for c in (w - 1) * 100 + 1..=w * 100 {
+                b.observe_inbound(now, PathId::Main, &data_frame(c));
+            }
+            let rep = b.maybe_build_report(now, now * 1000).unwrap();
+            a_on.ingest_report(now, now * 1000, &rep).unwrap();
+        }
+        assert_eq!(a_on.cc_rate_bps(), Some(4_000_000), "两份好窗 +ceil/8×2");
     }
 
     #[test]

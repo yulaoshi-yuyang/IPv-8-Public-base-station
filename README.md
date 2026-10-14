@@ -8,7 +8,7 @@ IPv8+ 是面向广域网的加密叠加网络：端到端 AEAD 隧道、低延�
 ## 特性
 
 - **加密通道**：X25519 密钥交换 + ChaCha20-Poly1305 / AES-GCM，防重放
-- **低延迟数据面**：Windows Registered I/O (RIO) 用户态收发，多路径竞速，FEC 前向纠错
+- **低延迟数据面**：Windows Registered I/O (RIO) 用户态收发，多路径竞速，FEC 前向纠错，拥塞控制（--cc 默认关）
 - **透明接入**：未修改的应用程序经 wintun 虚拟网卡走 IPv8+ 网络
 - **可编程钩子**：出站（加密前）/ 入站（解密后）数据包可由外部程序判决（放行 / 丢弃 / 修改 / 延迟 / 镜像 / 限速）
 
@@ -47,7 +47,7 @@ powershell -ExecutionPolicy Bypass -File scripts\notun-selftest.ps1
 - `src/cloud/` — 云端服务：ans（地址分配）/ resolver（会合解析）/ zoneserver（区域服务）
 - `src/driver/` — NDIS 协议驱动 ipv8proto 与属性页 ipv8prop（P8，开发用）
 - `src/tools/` — 命令行工具：ipv8-client / ipv8-forward / ipv8-netbench / ws-node
-- `deploy/` — 部署脚本与客户端资源（wintun 权威副本、防火墙、NRPT、门户 UI）
+- `deploy/` — 部署脚本与客户端资源（wintun 权威副本、防火墙、NRPT、门户 UI、exit-node 出入口配置）
 - `scripts/` — 打包、交叉验证、自检脚本
 - `shared/` — protobuf 协议定义与测试向量
 - `docs/` — charter、停车场、依赖账、log、ADR、技术债册

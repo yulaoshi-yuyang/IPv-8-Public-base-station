@@ -136,8 +136,13 @@ pub(crate) enum UdpIo {
 
 impl UdpIo {
     /// 按模式绑定。`On` 失败返回错误（用户强制）；`Auto` 失败打印原因并回退 std；
-    /// `Off` 只走 std。
-    pub(crate) fn bind(addr: SocketAddr, mode: RioMode) -> io::Result<Self> {
+    /// `Off` 只走 std。L2 模式按 `l2_peer_v4` 选同子网 bound 网卡（多网卡机），
+    /// 传 None 或匹配不到时回退第一张并打印警告。
+    pub(crate) fn bind(
+        addr: SocketAddr,
+        mode: RioMode,
+        l2_peer_v4: Option<Ipv4Addr>,
+    ) -> io::Result<Self> {
         match mode {
             RioMode::Off => Ok(UdpIo::Std(Self::bind_std(addr)?)),
             RioMode::On => Ok(UdpIo::Rio(Arc::new(RioRuntime::create_with_fallback(
@@ -154,7 +159,7 @@ impl UdpIo {
                 }
             },
             RioMode::L2 => {
-                let l2 = L2Io::bind()?;
+                let l2 = L2Io::bind(l2_peer_v4)?;
                 println!(
                     "[l2] 已打开 ipv8proto.sys 0xFB14 数据面: if_index={}, local_mac={:02x?}",
                     l2.if_index(),
@@ -245,8 +250,11 @@ const IPV8_RECV_IN_LEN: usize = 16; // magic(4) + ifindex(4) + reserved(8)
 const IPV8_FRAME_HDR_LEN: usize = 16;
 const IPV8_FRAME_MAX: usize = 1514;
 const IPV8_BINDING_SIZE: usize = 180; // driver.h 里 IPV8_BINDING 结构大小
+const IPV8_BINDINGS_HDR_LEN: usize = 16; // Magic/Total/Count/Reserved
+const IPV8_DRIVER_MAGIC: u32 = 0x0000_FB14;
 const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
 const ERROR_IO_PENDING: i32 = 997;
+const ERROR_OPERATION_ABORTED: i32 = 995;
 const WAIT_TIMEOUT: u32 = 258;
 
 // L2 FFI（CreateFileW / DeviceIoControl / GetOverlappedResult 需自行声明；
@@ -277,12 +285,16 @@ extern "system" {
         lpnumberofbytestransferred: *mut u32,
         bwait: i32,
     ) -> i32;
+    fn CancelIoEx(hfile: isize, lpoverlapped: *mut c_void) -> i32;
 }
 
 /// L2 传输层：经 ipv8proto.sys IOCTL 收发 0xFB14 以太网帧
 pub(crate) struct L2Io {
     handle: isize,
-    event: HANDLE,
+    // send/recv 在不同线程并发，event 必须分开；共用一个会导致一方完成
+    // 唤醒另一方等待（P8 真机 2026-10-14 抓到：recv 孤儿 IRP 完成事件打醒发送）。
+    send_event: HANDLE,
+    recv_event: HANDLE,
     if_index: u32,
     local_mac: [u8; 6],
     /// 对端 MAC（None=广播，或运行时 set）
@@ -290,8 +302,9 @@ pub(crate) struct L2Io {
 }
 
 impl L2Io {
-    /// 打开驱动 + 绑定第一张 bound 网卡
-    pub(crate) fn bind() -> io::Result<Self> {
+    /// 打开驱动 + 选卡绑定。多网卡机按对端 IPv4 同子网选卡（peer 的 underlay
+    /// IP 已知）；无提示或匹配不到时回退驱动枚举的第一张 bound 网卡并警告。
+    pub(crate) fn bind(peer_v4: Option<Ipv4Addr>) -> io::Result<Self> {
         // CreateFileW: GENERIC_READ|GENERIC_WRITE (0xC0000000), FILE_SHARE_READ|WRITE (3), OPEN_EXISTING (3)
         let wide: Vec<u16> = IPV8_DRIVER_PATH.encode_utf16().chain([0]).collect();
         let handle = unsafe {
@@ -300,19 +313,62 @@ impl L2Io {
         if handle == -1 {
             return Err(io::Error::last_os_error());
         }
-        let event = unsafe { CreateEventW(ptr::null(), 0, 0, ptr::null()) };
-        if event == 0 {
+        let send_event = unsafe { CreateEventW(ptr::null(), 0, 0, ptr::null()) };
+        if send_event == 0 {
             unsafe { CloseHandle(handle) };
             return Err(io::Error::last_os_error());
         }
-        // 查 bindings 拿第一张 bound 网卡的 if_index 和 MAC
-        let bindings = unsafe { l2_query_bindings(handle)? };
-        let binding = bindings.into_iter().next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "ipv8proto.sys 已安装但无网卡 bound")
-        })?;
+        let recv_event = unsafe { CreateEventW(ptr::null(), 0, 0, ptr::null()) };
+        if recv_event == 0 {
+            unsafe {
+                CloseHandle(send_event);
+                CloseHandle(handle);
+            }
+            return Err(io::Error::last_os_error());
+        }
+        // 查 bindings，按对端 IPv4 同子网选卡，回退第一张
+        let bindings = unsafe { l2_query_bindings(handle) };
+        if bindings.is_err() {
+            unsafe {
+                CloseHandle(recv_event);
+                CloseHandle(send_event);
+                CloseHandle(handle);
+            }
+            return Err(bindings.err().unwrap());
+        }
+        let bindings = bindings.unwrap();
+        if bindings.is_empty() {
+            unsafe {
+                CloseHandle(recv_event);
+                CloseHandle(send_event);
+                CloseHandle(handle);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "ipv8proto.sys 已安装但无网卡 bound",
+            ));
+        }
+        let binding = match peer_v4.and_then(|peer| l2_pick_by_subnet(&bindings, peer)) {
+            Some(b) => {
+                println!("[l2] 按对端 {peer_v4:?} 同子网选中 if#{}", b.if_index);
+                b
+            }
+            None => {
+                let fallback = bindings[0].clone();
+                eprintln!(
+                    "[l2] 未能按对端子网定位网卡（peer_v4={peer_v4:?}，{} 张 bound 卡），\
+                     回退第一张 if#{} local_mac={:02x?}——多网卡环境若该卡不在对端网段将无法互通",
+                    bindings.len(),
+                    fallback.if_index,
+                    fallback.mac
+                );
+                fallback
+            }
+        };
         Ok(Self {
             handle,
-            event,
+            send_event,
+            recv_event,
             if_index: binding.if_index,
             local_mac: binding.mac,
             peer_mac: std::sync::Mutex::new(None),
@@ -337,17 +393,13 @@ impl L2Io {
                 format!("L2 payload 过长: {} > {}", buf.len(), IPV8_FRAME_MAX - IPV8_ETH_HEADER_LEN),
             ));
         }
-        // 16B frame header + 14B eth header + payload
-        let mut frame = Vec::with_capacity(16 + IPV8_ETH_HEADER_LEN + buf.len());
-        frame.extend_from_slice(&0xFB14u32.to_le_bytes()); // magic
-        frame.extend_from_slice(&self.if_index.to_le_bytes());
-        frame.extend_from_slice(&0u32.to_le_bytes()); // reserved
-        frame.extend_from_slice(&dst_mac);              // dst MAC
-        frame.extend_from_slice(&[0u8; 6]);             // src MAC (驱动覆写)
-        frame.push(0xFB); frame.push(0x14);              // EtherType
-        frame.extend_from_slice(buf);
+        // 16B IPV8_FRAME_HDR（Magic/IfIndex/FrameLen/Reserved）+ 14B 以太头 + payload。
+        // FrameLen 是驱动硬校验字段（driver-ctl.c IPv8IoctlSend：<14 或 >1514 直接
+        // STATUS_INVALID_PARAMETER），权威范本：ipv8-client 注入路径 buf[8..12]=frame.len()。
+        let frame = l2_build_send_frame(self.if_index, dst_mac, buf);
 
-        let ov = unsafe { l2_overlapped(self.event) };
+        let ov = unsafe { l2_overlapped(self.send_event) };
+        let _guard = OvGuard(ov); // 任何出口都必须回收 OVERLAPPED
         let ok = unsafe {
             DeviceIoControl(
                 self.handle,
@@ -363,16 +415,20 @@ impl L2Io {
         if ok != 0 {
             return Ok(());
         }
-        let err = std::io::Error::last_os_error().raw_os_error();
-        if err != Some(ERROR_IO_PENDING) {
+        if io::Error::last_os_error().raw_os_error() != Some(ERROR_IO_PENDING) {
             return Err(io::Error::other("SEND_FRAME IOCTL 失败"));
         }
-        // 等待
-        match unsafe { WaitForSingleObject(self.event, 2000) } {
-            WAIT_OBJECT_0 => Ok(()),
-            WAIT_TIMEOUT => Err(io::Error::new(io::ErrorKind::TimedOut, "SEND_FRAME 超时")),
-            _ => Err(io::Error::other("WaitForSingleObject 失败")),
-        }
+        // PENDING：等到 SendComplete；超时必须 CancelIoEx 让 IRP 落地，
+        // 否则 IRP 孤儿化（占 TX inflight 节点）且完成事件会打醒后续等待。
+        unsafe { l2_await(self.handle, self.send_event, ov, 2000) }
+            .map(|_| ())
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::TimedOut {
+                    io::Error::new(io::ErrorKind::TimedOut, "SEND_FRAME 超时")
+                } else {
+                    e
+                }
+            })
     }
 
     /// 接收 IPv8+ 帧：RECV_FRAME IOCTL → 去掉 14B 以太网头 → 返回 (payload, src_mac)
@@ -381,7 +437,8 @@ impl L2Io {
         buf[0..4].copy_from_slice(&0xFB14u32.to_le_bytes());
         buf[4..8].copy_from_slice(&self.if_index.to_le_bytes());
 
-        let ov = unsafe { l2_overlapped(self.event) };
+        let ov = unsafe { l2_overlapped(self.recv_event) };
+        let _guard = OvGuard(ov);
         let mut out_len: u32 = 0;
         let ok = unsafe {
             DeviceIoControl(
@@ -398,18 +455,19 @@ impl L2Io {
         let total = if ok != 0 {
             out_len as usize
         } else {
-            let err = std::io::Error::last_os_error().raw_os_error();
-            if err != Some(ERROR_IO_PENDING) {
+            if io::Error::last_os_error().raw_os_error() != Some(ERROR_IO_PENDING) {
                 return Err(io::Error::other("RECV_FRAME IOCTL 失败"));
             }
-            match unsafe { WaitForSingleObject(self.event, 1000) } {
-                WAIT_OBJECT_0 => {
-                    let mut n: u32 = 0;
-                    unsafe { GetOverlappedResult(self.handle, ov, &mut n, 0) };
-                    n as usize
+            // PENDING：无帧时驱动把 IRP 挂 CSQ；超时按驱动契约 CancelIoEx
+            // （driver-ctl.c：内核不实现超时，取消经 CSQ CompleteCanceledIrp 回完）。
+            // 不取消会让 IRP 永久排队，后续帧 FIFO 完成给无人等待的旧 IRP——
+            // 表现为 Rx 计数增长但 recv 全超时（P8 真机 2026-10-14 抓到）。
+            match unsafe { l2_await(self.handle, self.recv_event, ov, 1000) } {
+                Ok(n) => n as usize,
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "RECV_FRAME 超时"));
                 }
-                WAIT_TIMEOUT => return Err(io::Error::new(io::ErrorKind::TimedOut, "RECV_FRAME 超时")),
-                _ => return Err(io::Error::other("WaitForSingleObject 失败")),
+                Err(e) => return Err(e),
             }
         };
 
@@ -432,23 +490,123 @@ impl L2Io {
     pub(crate) fn local_mac(&self) -> [u8; 6] { self.local_mac }
 }
 
+impl Drop for L2Io {
+    fn drop(&mut self) {
+        // 关句柄触发驱动 CLEANUP，回完本句柄全部挂起 IRP（CSQ ByFileObject 匹配）。
+        // 前提：调用方已停收发线程；进程退出场景由 OS 兜底。
+        unsafe {
+            CloseHandle(self.recv_event);
+            CloseHandle(self.send_event);
+            CloseHandle(self.handle);
+        }
+    }
+}
+
 // ── L2Io 私有辅助 ──
+
+/// 纯函数：构造 SEND_FRAME 输入缓冲 = 16B IPV8_FRAME_HDR + 14B 以太头 + payload。
+/// 布局锁死（driver.h IPV8_FRAME_HDR，#pragma pack(1)）：
+/// magic@0 ifindex@4 **framelen@8** reserved@12；以太头 dst@16 src@22 ethertype@28。
+/// src MAC 留零由驱动覆写。曾因漏掉 FrameLen 字段（12B 头 + 以太头整体错位 4B）
+/// 导致驱动 STATUS_INVALID_PARAMETER——P8 真机验收 2026-10-14 抓到。
+fn l2_build_send_frame(if_index: u32, dst_mac: [u8; 6], payload: &[u8]) -> Vec<u8> {
+    let frame_len = (IPV8_ETH_HEADER_LEN + payload.len()) as u32;
+    let mut frame = Vec::with_capacity(IPV8_FRAME_HDR_LEN + IPV8_ETH_HEADER_LEN + payload.len());
+    frame.extend_from_slice(&0xFB14u32.to_le_bytes()); // Magic
+    frame.extend_from_slice(&if_index.to_le_bytes());
+    frame.extend_from_slice(&frame_len.to_le_bytes()); // FrameLen（驱动硬校验 14..=1514）
+    frame.extend_from_slice(&0u32.to_le_bytes()); // Reserved
+    frame.extend_from_slice(&dst_mac);
+    frame.extend_from_slice(&[0u8; 6]); // src MAC（驱动覆写）
+    frame.push(0xFB);
+    frame.push(0x14); // EtherType 0xFB14
+    frame.extend_from_slice(payload);
+    frame
+}
 
 /// 构造 OVERLAPPED 结构（零初始化 + hEvent）
 unsafe fn l2_overlapped(event: HANDLE) -> *mut c_void {
     let ov: [u8; 64] = zeroed();
     let p = Box::into_raw(Box::new(ov)) as *mut c_void;
-    // OVERLAPPED 偏移 40 处是 hEvent（win64）
+    // win64 OVERLAPPED：Internal@0(8) InternalHigh@8(8) Offset/Pointer@16(8) hEvent@24(8)，共 32B。
+    // 曾误写偏移 40，event 永不置位：每个 PENDING IRP 走满超时+取消等待，
+    // 取消不消耗驱动队列帧导致积压暴发与重放窗丢弃——P8 真机 2026-10-14 第八轮抓到。
     let bytes = std::slice::from_raw_parts_mut(p as *mut u8, 64);
-    bytes[..40].fill(0);
     let ev = event as u64;
-    bytes[40..48].copy_from_slice(&ev.to_le_bytes());
+    bytes[24..32].copy_from_slice(&ev.to_le_bytes());
     p
 }
 
-/// 查 driver bindings（返回每张 bound 网卡的 if_index + MAC）
+/// 回收 l2_overlapped 分配的 64B OVERLAPPED（IRP 已落地后才可 drop）。
+unsafe fn l2_free_overlapped(ov: *mut c_void) {
+    drop(Box::from_raw(ov as *mut [u8; 64]));
+}
+
+/// RAII：任何返回路径（含校验失败）都回收 OVERLAPPED。
+struct OvGuard(*mut c_void);
+impl Drop for OvGuard {
+    fn drop(&mut self) {
+        unsafe { l2_free_overlapped(self.0) };
+    }
+}
+
+/// 等待已确认 ERROR_IO_PENDING 的 overlapped 请求。
+/// 超时 → CancelIoEx → 等取消落地 → GetOverlappedResult 终裁：
+/// 取消与完成竞态时，帧抢先完成算成功；ERROR_OPERATION_ABORTED 算超时。
+/// 驱动契约（driver-ctl.c 行 407-409）：内核无超时，挂起 IRP 只能由
+/// CancelIoEx / CLEANUP / 卸载回完，不允许用户态撒手不管。
+unsafe fn l2_await(
+    handle: isize,
+    event: HANDLE,
+    ov: *mut c_void,
+    timeout_ms: u32,
+) -> io::Result<u32> {
+    let wait = WaitForSingleObject(event, timeout_ms);
+    if wait == WAIT_OBJECT_0 {
+        let mut n: u32 = 0;
+        return if GetOverlappedResult(handle, ov, &mut n, 0) != 0 {
+            Ok(n)
+        } else {
+            Err(io::Error::last_os_error())
+        };
+    }
+    // WAIT_FAILED 也走取消兜底，避免 IRP 孤儿化
+    if wait != WAIT_TIMEOUT {
+        CancelIoEx(handle, ov);
+        WaitForSingleObject(event, 2000);
+        return Err(io::Error::other("WaitForSingleObject 失败"));
+    }
+    CancelIoEx(handle, ov);
+    // 等 CSQ CompleteCanceledIrp / 抢先完成把 event 置位
+    WaitForSingleObject(event, 2000);
+    let mut n: u32 = 0;
+    if GetOverlappedResult(handle, ov, &mut n, 0) != 0 {
+        return Ok(n); // 竞态：帧在取消生效前完成
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(ERROR_OPERATION_ABORTED) => {
+            Err(io::Error::new(io::ErrorKind::TimedOut, "overlapped 超时已取消"))
+        }
+        code => Err(io::Error::other(format!(
+            "overlapped 取消后异常 (os error {code:?})"
+        ))),
+    }
+}
+
+#[derive(Clone)]
+struct L2Binding {
+    /// 驱动自编号（非 Windows InterfaceIndex；SEND/RECV 帧头用它选适配器）
+    if_index: u32,
+    mac: [u8; 6],
+}
+
+/// GET_BINDINGS 输出头：Magic(4) Total(4) Count(4) Reserved(4) = 16B。
+/// entry 布局（v0.10，pack(1) 180B，与 driver-ctl.c / ipv8-client 对齐）：
+/// rx@0 tx@8 rxdrop@16 txdrop@24 bound@32 ifindex@36 mac@40 pad@46
+/// namechars@48 name@52。5A 时代是无头部 144B 旧 ABI，曾导致 node 恒报
+/// "无网卡 bound"——P8 真机验收 2026-10-14 抓到。
 unsafe fn l2_query_bindings(handle: isize) -> io::Result<Vec<L2Binding>> {
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; 64 * 1024];
     let mut out_len: u32 = 0;
     let ok = DeviceIoControl(
         handle,
@@ -463,22 +621,113 @@ unsafe fn l2_query_bindings(handle: isize) -> io::Result<Vec<L2Binding>> {
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    let count = (out_len as usize) / IPV8_BINDING_SIZE;
+    if (out_len as usize) < IPV8_BINDINGS_HDR_LEN
+        || u32::from_le_bytes(buf[0..4].try_into().unwrap()) != IPV8_DRIVER_MAGIC
+    {
+        return Err(io::Error::other(
+            "绑定响应格式无效（驱动版本过旧？需要 ipv8proto.sys v0.10+）",
+        ));
+    }
+    let count = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
     let mut bindings = Vec::with_capacity(count);
     for i in 0..count {
-        let off = i * IPV8_BINDING_SIZE;
-        let bound = buf[off + 12] != 0; // offset 12 是 bound 标志（u32 bool）
-        if !bound { continue; }
-        let if_index = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
-        let mac: [u8; 6] = buf[off + 16..off + 22].try_into().unwrap();
+        let base = IPV8_BINDINGS_HDR_LEN + i * IPV8_BINDING_SIZE;
+        if base + IPV8_BINDING_SIZE > out_len as usize {
+            break;
+        }
+        if u32::from_le_bytes(buf[base + 32..base + 36].try_into().unwrap()) == 0 {
+            continue; // 解绑中
+        }
+        let if_index = u32::from_le_bytes(buf[base + 36..base + 40].try_into().unwrap());
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&buf[base + 40..base + 46]);
         bindings.push(L2Binding { if_index, mac });
     }
     Ok(bindings)
 }
 
-struct L2Binding {
-    if_index: u32,
-    mac: [u8; 6],
+/// 枚举本机 Up 适配器的（MAC, IPv4, 前缀长度）。只做 L2 选卡，任何失败返回空表，
+/// 调用方按"选不到就回退第一张"处理——FFI 异常不得阻断隧道启动。
+unsafe fn l2_enum_adapters_v4() -> Vec<([u8; 6], Ipv4Addr, u8)> {
+    use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+        GAA_FLAG_SKIP_FRIENDLY_NAME, GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
+    };
+    // IF_OPER_STATUS_UP：windows-sys 0.52 未导出该枚举名，SDK 字面值为 1（类型 i32）
+    const IF_OPER_STATUS_UP: i32 = 1;
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
+
+    let flags = GAA_FLAG_SKIP_ANYCAST
+        | GAA_FLAG_SKIP_MULTICAST
+        | GAA_FLAG_SKIP_DNS_SERVER
+        | GAA_FLAG_SKIP_FRIENDLY_NAME;
+    let mut len: u32 = 16 * 1024;
+    let mut raw = vec![0u8; len as usize];
+    let mut ret = GetAdaptersAddresses(
+        AF_INET as u32,
+        flags,
+        ptr::null(),
+        raw.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>(),
+        &mut len,
+    );
+    if ret == ERROR_BUFFER_OVERFLOW {
+        raw = vec![0u8; len as usize];
+        ret = GetAdaptersAddresses(
+            AF_INET as u32,
+            flags,
+            ptr::null(),
+            raw.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>(),
+            &mut len,
+        );
+    }
+    if ret != ERROR_SUCCESS {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut adapter = raw.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+    while !adapter.is_null() {
+        let mac_len = (*adapter).PhysicalAddressLength as usize;
+        if (*adapter).OperStatus == IF_OPER_STATUS_UP && mac_len == 6 {
+            let mut mac = [0u8; 6];
+            mac.copy_from_slice(&(&(*adapter).PhysicalAddress)[..6]);
+            let mut ua = (*adapter).FirstUnicastAddress;
+            while !ua.is_null() {
+                let sa = (*ua).Address.lpSockaddr as *const SOCKADDR_IN;
+                if !sa.is_null() && (*sa).sin_family == AF_INET {
+                    // S_addr 网络字节序（大端），转 host 后与 u32::from(Ipv4Addr) 同序
+                    let ip = Ipv4Addr::from(u32::from_be((*sa).sin_addr.S_un.S_addr));
+                    out.push((mac, ip, (*ua).OnLinkPrefixLength));
+                }
+                ua = (*ua).Next;
+            }
+        }
+        adapter = (*adapter).Next;
+    }
+    out
+}
+
+/// 在驱动 bound 卡里选一张本机 IPv4 与 peer 同子网的。同 MAC 多地址任一匹配即可。
+fn l2_pick_by_subnet(bindings: &[L2Binding], peer: Ipv4Addr) -> Option<L2Binding> {
+    let adapters = unsafe { l2_enum_adapters_v4() };
+    bindings
+        .iter()
+        .find(|b| {
+            adapters.iter().any(|(mac, ip, prefix)| {
+                *mac == b.mac && l2_same_subnet(*ip, peer, *prefix)
+            })
+        })
+        .cloned()
+}
+
+/// 同子网判定（纯函数）。prefix 异常按 /32 收紧，绝不放宽。
+fn l2_same_subnet(ip: Ipv4Addr, peer: Ipv4Addr, prefix: u8) -> bool {
+    if prefix >= 32 {
+        return ip == peer;
+    }
+    let mask = u32::MAX << (32 - prefix);
+    u32::from(ip) & mask == u32::from(peer) & mask
 }
 
 /// 一个收割到的入站完成：槽号 + 字节数 + 对端地址。载荷借用见
@@ -1239,6 +1488,67 @@ mod tests {
         t.free(c);
         assert_eq!(t.alloc(), Some(0));
         assert_eq!(t.alloc(), Some(1));
+    }
+
+    #[test]
+    fn l2_same_subnet_masks_by_prefix() {
+        let ip = Ipv4Addr::new(192, 168, 200, 2);
+        // /24：主路径对端同段
+        assert!(l2_same_subnet(ip, Ipv4Addr::new(192, 168, 200, 1), 24));
+        // uplink 段对 peer 必须判异（B 机选错卡的根因场景）
+        assert!(!l2_same_subnet(
+            Ipv4Addr::new(172, 23, 19, 188),
+            Ipv4Addr::new(192, 168, 200, 1),
+            24
+        ));
+        // /16 跨段判异
+        assert!(!l2_same_subnet(
+            Ipv4Addr::new(192, 168, 201, 2),
+            Ipv4Addr::new(192, 168, 200, 1),
+            24
+        ));
+        // /32 与异常前缀（>32）收紧为严格相等
+        assert!(!l2_same_subnet(ip, Ipv4Addr::new(192, 168, 200, 1), 32));
+        assert!(l2_same_subnet(ip, ip, 32));
+        assert!(!l2_same_subnet(ip, Ipv4Addr::new(192, 168, 200, 1), 33));
+    }
+
+    #[test]
+    fn l2_build_send_frame_abi_layout() {
+        // 锁死 SEND_FRAME ABI（driver.h IPV8_FRAME_HDR）：少写 FrameLen 会让
+        // 驱动 STATUS_INVALID_PARAMETER，真机表现为首发即"SEND_FRAME IOCTL 失败"。
+        let payload = vec![0xAAu8; 100];
+        let dst = [0x00, 0x15, 0x5D, 0x83, 0xB5, 0x11];
+        let f = l2_build_send_frame(2, dst, &payload);
+
+        assert_eq!(f.len(), IPV8_FRAME_HDR_LEN + IPV8_ETH_HEADER_LEN + 100);
+        assert_eq!(&f[0..4], 0xFB14u32.to_le_bytes()); // Magic
+        assert_eq!(&f[4..8], 2u32.to_le_bytes()); // IfIndex
+        assert_eq!(&f[8..12], (IPV8_ETH_HEADER_LEN as u32 + 100).to_le_bytes()); // FrameLen
+        assert_eq!(&f[12..16], 0u32.to_le_bytes()); // Reserved
+        assert_eq!(&f[16..22], &dst); // 以太头 dst
+        assert_eq!(&f[22..28], &[0u8; 6]); // src 留零，驱动覆写
+        assert_eq!(&f[28..30], &[0xFB, 0x14]); // EtherType
+        assert_eq!(&f[30..130], &payload[..]);
+        // 最小 payload：FrameLen=14 恰好过驱动下界
+        let fmin = l2_build_send_frame(1, [0xFF; 6], &[]);
+        assert_eq!(&fmin[8..12], 14u32.to_le_bytes());
+        assert_eq!(fmin.len(), IPV8_FRAME_HDR_LEN + IPV8_ETH_HEADER_LEN);
+    }
+
+    #[test]
+    fn l2_overlapped_hevent_offset_24() {
+        // 锁死 win64 OVERLAPPED ABI：hEvent 在偏移 24（Internal/InternalHigh/Pointer 各 8B）。
+        // 误写偏移 40 时 event 永不置位，PENDING IRP 全部走满超时+取消路径。
+        let fake_event = 0x1234_5678_9ABC_DEF0u64 as isize;
+        let ov = unsafe { l2_overlapped(fake_event) };
+        let bytes = unsafe { std::slice::from_raw_parts(ov as *const u8, 64) };
+        assert_eq!(&bytes[24..32], fake_event.to_le_bytes());
+        // 偏移 40（历史错误值）必须保持为 0，其余字段全零
+        assert_eq!(&bytes[40..48], &[0u8; 8]);
+        assert_eq!(&bytes[0..24], &[0u8; 24]);
+        assert_eq!(&bytes[32..64], &[0u8; 32]);
+        unsafe { l2_free_overlapped(ov) };
     }
 
     #[test]
