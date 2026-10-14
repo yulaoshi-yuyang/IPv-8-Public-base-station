@@ -9,3 +9,4 @@
 | P8 `--l2` 代码已完成（wintun-node L2Io + rio.rs），未双机真机验证 | 代码落地后优先推进了 IPv6 双栈与启动脚本，P8 验收延后 | 已还 2026-10-14：Hyper-V 双 VM 四判据 ALL PASS（双轨建邻等价 / `--l2` ping 20/20 drop=0 / UDP 轨 10/10 零回归 / 垃圾帧 21 帧不产生状态），验收期修缺陷 6 个，证据见 log 2026-10-14 |
 | wintun-node `main.rs` 约 2600 行上帝文件：参数解析、TUN 装配、数据面流水线、转发逻辑全在一处 | 阶段验证期以快速接通为先，拆分一直后置；继续膨胀将拖垮理解速度 | 下次"加厚地基"窗口：按职责拆出 config/tun 装配/数据面模块，每拆一步保持测试全绿 |
 | git 索引未同步：`deploy/cross-verify/` 三个脚本仍被追踪，`doctor.ps1` 已搬 `scripts/` 但索引未记改名 | 本机无 git CLI，绝不手改二进制索引；磁盘侧已按生成目录治理完毕 | 首次在装有 git CLI 的机器上执行 `git add -A deploy/cross-verify scripts/doctor.ps1`，让 git 记录删除与改名 |
+| 拥塞控制 D2：`Pacer::wait` 的 `sleep` 落在 TUN 读线程内（`spawn_tun_reader`→`dispatch_tun_batch` 单线程），批后追平睡眠期 wintun 环无人排空 → 灌包期环溢出丢包 → ①同环 FIFO 上的延迟敏感流（ICMP ping）被挤到满载 0/5（CC 关闭对照 5/5）；②溢出丢包被对端观测 → CC 丢包兜底触发 → 速率锯齿（爬满 ceil 后连降 5 窗到 floor 再爬） | 正解=把限速从读线程剥离（独立发送线程/有界队列）或引入优先级（接线 ipv8-qos），属 ADR 级结构决策，成本高；真机验收 2026-10-14 已登记，输 `--cc` 前不默认开启 | 接线 ipv8-qos 时一并处理（停车场 QoS 行使数据面接线点=引擎发送路径）／下次"加厚地基"窗口 |

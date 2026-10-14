@@ -275,8 +275,7 @@ mod tests {
         assert_eq!(a_off.cc_rate_bps(), None);
 
         // --cc 开（ceil=8Mbps）：起步=ceil/4=2M
-        let mut cfg = ObserveConfig::default();
-        cfg.cc = Some(CcConfig::new(8_000_000));
+        let cfg = ObserveConfig { cc: Some(CcConfig::new(8_000_000)), ..Default::default() };
         let mut a_on = ObserveNode::new(cfg);
         assert_eq!(a_on.cc_rate_bps(), Some(2_000_000));
 

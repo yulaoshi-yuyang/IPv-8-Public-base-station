@@ -1992,6 +1992,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
         pacer: cfg.cc.then(|| Mutex::new(Pacer::new())),
         test_drop: cfg.test_drop_file.map(TestDrop::new),
     });
+    // 取证口：主循环周期 [stats] 打印读 cc 当前速率（--cc 关时 None → 打印 off）
+    let observe_handle = plane.observe.clone();
 
     /// 单批 TUN 排空上界：wintun 官方 C API 只有单包 Receive/Send，
     /// 真正省的是每包一次 engine/sched 互斥锁与逐包 send 的调用开销。
@@ -2453,8 +2455,16 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
                         );
                         established_reported = true;
                     } else {
+                        // ADR-0003 取证口：cc_rate 当前限速 bit/s（--cc 关 → off）。
+                        // 真机验收判"吞吐收敛 ceil 附近"直接读此行，不靠反推。
+                        let cc_now = observe_handle
+                            .lock()
+                            .expect("observe")
+                            .cc_rate_bps()
+                            .map(|r| r.to_string())
+                            .unwrap_or_else(|| "off".to_string());
                         println!(
-                            "[stats] epoch={} sealed={} delivered={} dropped={} frags_sent={} frags_reassembled={} plain_tx={} plain_rx={} echo_ok={} echo_bad={} shards={}",
+                            "[stats] epoch={} sealed={} delivered={} dropped={} frags_sent={} frags_reassembled={} plain_tx={} plain_rx={} echo_ok={} echo_bad={} shards={} cc_rate={}",
                             st.send_epoch.unwrap_or(0),
                             sealed,
                             deliv,
@@ -2465,7 +2475,8 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
                             plain_rx,
                             echo_ok.load(Ordering::Relaxed),
                             echo_bad.load(Ordering::Relaxed),
-                            nsh
+                            nsh,
+                            cc_now
                         );
                     }
                     if let Some(h) = &hook_bus {
