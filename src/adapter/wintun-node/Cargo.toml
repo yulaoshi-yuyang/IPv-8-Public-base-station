@@ -27,6 +27,7 @@ sha2 = { workspace = true }
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
     "Win32_System_Threading",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }

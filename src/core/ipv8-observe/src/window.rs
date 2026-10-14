@@ -1,6 +1,6 @@
 //! Data 帧计数器接收观测：稀疏滑动窗 + 跨密钥代（SA）累计统计。
 //!
-//! 计数器是 Data 帧尾的明文 AEAD nonce，无需解密即可提取。每个 SA（帧头 KeyID）
+//! 计数器是 Data 帧体中明文段后的 8B AEAD nonce，无需解密即可提取。每个 SA（帧头 KeyID）
 //! 一个窗口；窗口口径对齐 tunnel `RxWindow`（128 宽位图），累计量单调递增供
 //! 回执按周期做差值：`expected`=计数器跨度（丢包分母），`seen`=唯一到达帧数。
 
@@ -18,8 +18,8 @@ pub const DATA_MIN_FRAME: usize = 74;
 pub(crate) const FRAME_HEADER_LEN: usize = 10;
 pub(crate) const TUNNEL_VERSION: u8 = 0x01;
 pub(crate) const DATA_FRAME_TYPE: u8 = 2;
-/// 计数器距帧尾的偏移：len-24..len-16
-const COUNTER_FROM_END: usize = 24;
+/// IPv8+ 基础头长度（明文段下限）
+pub(crate) const BASE_HEADER_SIZE: usize = 40;
 
 /// 单路径（或并集）截至某时刻的累计计数（u64 累计，对端做 wrapping 差值）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +49,12 @@ impl Default for PathCounters {
 }
 
 /// 从线帧提取 (KeyID, counter)；非 Data/过短/版本不符返回 None。
-pub(crate) fn frame_meta(frame: &[u8]) -> Option<(u64, u64)> {
+///
+/// 帧布局：`[header:10B][plain:变长][counter:8B][ciphertext+tag:变长]`
+/// counter 在明文段之后、密文之前，偏移 = 10 + plain_len。
+/// plain_len 由解析 IPv8+ 基础头(40B)+扩展头链得到。
+/// pub：node 层测试丢包注入（--test-drop-file）复用同一解析，避免两份线格式知识。
+pub fn frame_meta(frame: &[u8]) -> Option<(u64, u64)> {
     if frame.len() < DATA_MIN_FRAME
         || frame[0] != TUNNEL_VERSION
         || frame[1] != DATA_FRAME_TYPE
@@ -58,10 +63,50 @@ pub(crate) fn frame_meta(frame: &[u8]) -> Option<(u64, u64)> {
     }
     let mut k = [0u8; 8];
     k.copy_from_slice(&frame[2..FRAME_HEADER_LEN]);
-    let tail = frame.len() - COUNTER_FROM_END;
+    let body = &frame[FRAME_HEADER_LEN..];
+    let plain_len = plain_segment_len(body)?;
+    let off = FRAME_HEADER_LEN + plain_len;
+    if off + 8 > frame.len() {
+        return None;
+    }
     let mut c = [0u8; 8];
-    c.copy_from_slice(&frame[tail..tail + 8]);
+    c.copy_from_slice(&frame[off..off + 8]);
     Some((u64::from_be_bytes(k), u64::from_be_bytes(c)))
+}
+
+/// 解析 IPv8+ 明文段长度 = 基础头(40B) + 扩展头链总长。
+/// body[6] = NextHeader；0 = 无扩展头。扩展头格式：[next:1B][len:1B][payload:len*8B]。
+fn plain_segment_len(body: &[u8]) -> Option<usize> {
+    if body.len() < BASE_HEADER_SIZE {
+        return None;
+    }
+    let next_header = body[6];
+    if next_header == 0 {
+        return Some(BASE_HEADER_SIZE);
+    }
+    let mut cursor = BASE_HEADER_SIZE;
+    let mut cur_type = next_header;
+    let mut seen = [false; 256];
+    loop {
+        if cursor + 2 > body.len() || seen[cur_type as usize] {
+            return None;
+        }
+        seen[cur_type as usize] = true;
+        let ptr_next = body[cursor];
+        let ext_len = body[cursor + 1];
+        if ext_len == 0 {
+            return None;
+        }
+        let plen = ext_len as usize * 8;
+        cursor += 2 + plen;
+        if cursor > body.len() {
+            return None;
+        }
+        if ptr_next == 0 {
+            return Some(cursor);
+        }
+        cur_type = ptr_next;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -204,8 +249,9 @@ mod tests {
         f[0] = TUNNEL_VERSION;
         f[1] = DATA_FRAME_TYPE;
         f[2..10].copy_from_slice(&key.to_be_bytes());
-        let tail = f.len() - COUNTER_FROM_END;
-        f[tail..tail + 8].copy_from_slice(&counter.to_be_bytes());
+        // body[6]=0 → next_header=0 → plain_len=40 → counter at offset 50
+        let off = FRAME_HEADER_LEN + BASE_HEADER_SIZE;
+        f[off..off + 8].copy_from_slice(&counter.to_be_bytes());
         f
     }
 

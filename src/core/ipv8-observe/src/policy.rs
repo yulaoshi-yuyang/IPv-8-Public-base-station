@@ -14,12 +14,10 @@ pub struct BreakerConfig {
     pub alive_age_ms: u32,
     /// closed→open：连续 N 个报告窗"main 活且 alt 死透"
     pub trigger_windows: u32,
-    /// open→closed：连续 M 个报告窗 alt 高质量（M 严于 N）
+    /// open→closed：连续 M 个报告窗 alt 存活（年龄≤alive_age_ms）。
+    /// 故意不收包率：熔断态本端停发 alt，对端无样本可算率；半开探针（1/8 帧）
+    /// 只够探活，5 窗滞回防抖动，质量差的路径恢复后立即再熔断。
     pub recover_windows: u32,
-    /// 恢复窗 alt 收包/期望比下限（per-mille）
-    pub recover_ratio_permille: u32,
-    /// 恢复窗最小期望样本数（样本不足判中性）
-    pub min_expected: u64,
 }
 
 impl Default for BreakerConfig {
@@ -30,8 +28,6 @@ impl Default for BreakerConfig {
             alive_age_ms: 600,
             trigger_windows: 3,
             recover_windows: 5,
-            recover_ratio_permille: 500,
-            min_expected: 32,
         }
     }
 }
@@ -66,26 +62,22 @@ impl Breaker {
         &self,
         main: &PathCounters,
         alt: &PathCounters,
-        alt_delta: (u64, u64),
     ) -> AltVerdict {
         let main_alive = main.last_recv_age_ms <= self.cfg.alive_age_ms;
         let alt_dead = alt.last_recv_age_ms > self.cfg.dead_age_ms;
         let alt_alive = alt.last_recv_age_ms <= self.cfg.alive_age_ms;
-        let (de, ds) = alt_delta;
-        let ratio_ok =
-            de >= self.cfg.min_expected && ds.saturating_mul(1000) >= de * u64::from(self.cfg.recover_ratio_permille);
         if main_alive && alt_dead {
             AltVerdict::Dead
-        } else if alt_alive && ratio_ok {
+        } else if alt_alive {
             AltVerdict::Good
         } else {
             AltVerdict::Neutral
         }
     }
 
-    /// 每份对端报告推进一次。`alt_delta`=(期望差, 到达差)，对端视角=本端发送质量
-    pub fn update(&mut self, main: &PathCounters, alt: &PathCounters, alt_delta: (u64, u64)) {
-        match self.classify(main, alt, alt_delta) {
+    /// 每份对端报告推进一次。判决只看对端报告的 main/alt 收包年龄（纯活性）。
+    pub fn update(&mut self, main: &PathCounters, alt: &PathCounters) {
+        match self.classify(main, alt) {
             AltVerdict::Dead => {
                 self.good_run = 0;
                 if !self.open {
@@ -214,25 +206,25 @@ mod tests {
         let live = pc(100);
         let dead = pc(u32::MAX);
         // 未连满 3 次不熔断
-        b.update(&live, &dead, (100, 0));
-        b.update(&live, &dead, (100, 0));
+        b.update(&live, &dead);
+        b.update(&live, &dead);
         assert!(!b.alt_disabled());
-        b.update(&live, &dead, (100, 0));
+        b.update(&live, &dead);
         assert!(b.alt_disabled());
         // open 后好窗不足 5 不恢复；插入中性清零
         let good = pc(100);
         for _ in 0..4 {
-            b.update(&live, &good, (100, 100));
+            b.update(&live, &good);
         }
         assert!(b.alt_disabled());
-        b.update(&live, &pc(800), (100, 50)); // 中性
-        b.update(&live, &good, (100, 100)); // good_run=1（清零后重数）
+        b.update(&live, &pc(800)); // 中性
+        b.update(&live, &good); // good_run=1（清零后重数）
         assert!(b.alt_disabled());
         for _ in 0..3 {
-            b.update(&live, &good, (100, 100));
+            b.update(&live, &good);
         }
         assert!(b.alt_disabled()); // 累计 4，仍不恢复
-        b.update(&live, &good, (100, 100)); // 第 5 连好窗
+        b.update(&live, &good); // 第 5 连好窗
         assert!(!b.alt_disabled());
     }
 
@@ -241,7 +233,7 @@ mod tests {
         // 双断=链路整体问题，不是 alt 单路径故障，保持双发
         let mut b = Breaker::default();
         for _ in 0..10 {
-            b.update(&pc(u32::MAX), &pc(u32::MAX), (0, 0));
+            b.update(&pc(u32::MAX), &pc(u32::MAX));
         }
         assert!(!b.alt_disabled());
     }

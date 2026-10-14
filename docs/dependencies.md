@@ -16,7 +16,7 @@
 | tonic | 0.12.3 | gRPC（云侧服务） | cloud/*, ipv8-grpc |
 | prost | 0.13.5 | protobuf 编解码（gRPC 载荷） | cloud/*, ipv8-grpc |
 | wintun | 0.5.1 | Windows TUN 设备 | wintun-node |
-| windows-sys | 0.52 / 0.61 | Win32 FFI（RIO、Winsock、设备 IOCTL） | wintun-node |
+| windows-sys | 0.52 / 0.61 | Win32 FFI（RIO、Winsock、设备 IOCTL、IpHelper 网卡枚举——P8 `--l2` 同子网选卡 l2_pick_by_subnet 用） | wintun-node |
 | mimalloc | 0.1.52 | 高性能内存分配器 | cloud/resolver |
 | rusqlite | 0.31.0 | SQLite 持久化（resolver 名称存储） | cloud/resolver |
 | serde | 1.0.229 | 序列化（配置、钩子协议） | ipv8-client, ipv8-hook |

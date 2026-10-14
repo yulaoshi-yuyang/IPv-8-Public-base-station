@@ -16,7 +16,8 @@ Abstract:
       常规   —— 本机 IPv8 身份（读 %USERPROFILE%\.ipv8\visa.bin：地址 + 签证
                 有效期）、名称解析说明、统一门户入口（ipv8.yulaoshi.xyz）。
       适配器 —— ipv8proto.sys 运行状态与逐适配器绑定/流量报表（\\.\IPv8Proto
-                三 IOCTL），手动刷新；驱动未运行时红横幅指引修复。
+                三 IOCTL），手动刷新；驱动未运行时中性降级说明（L2 仅可选路径，
+                核心 wintun/UDP 隧道不依赖该驱动，不是故障）。
 
     设计原则：控件要么展示真实数据要么执行真实动作；无假表单、无假状态灯。
     任何文件/IOCTL/剪贴板失败一律降级文案，绝不崩溃宿主进程。
@@ -595,9 +596,9 @@ static void SetAdapterErrorMode(HWND hDlg, bool error)
     ShowWindow(GetDlgItem(hDlg, IDC_BANNER_DRV), errorVis);
     if (error) {
         SetDlgItemTextW(hDlg, IDC_BANNER_DRV,
-            L"ipv8proto.sys 未运行，适配器统计不可用。\r\n"
-            L"请以管理员身份运行 scripts\\driver-install.ps1 安装并启动驱动，"
-            L"再点“刷新”。");
+            L"IPv8 L2 裸帧（EtherType 0xFB14）是局域网可选路径，当前未启用。\r\n"
+            L"核心隧道（wintun/UDP）不依赖该驱动，IPv8 网络运行不受影响。\r\n"
+            L"仅开发机做 L2 直连时才需管理员运行 scripts\\driver-install.ps1（测试签名模式）。");
     }
 }
 
@@ -649,12 +650,13 @@ static INT_PTR CALLBACK AdapterProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
         AdapterUi* ui = new (std::nothrow) AdapterUi();
         if (!ui)
             return TRUE;
-        ui->ErrorBrush = CreateSolidBrush(RGB(0xFD, 0xF1, 0xF0));
+        /* 中性降级：驱动缺席不是故障，横幅用与对话框同色底，不渲染成错误条 */
+        ui->ErrorBrush = CreateSolidBrush(GetSysColor(COLOR_WINDOW));
         SetWindowLongPtrW(hDlg, GWLP_USERDATA, (LONG_PTR)ui);
 
         InitListColumns(hDlg, GetDlgItem(hDlg, IDC_LIST));
         HICON errIcon = (HICON)LoadImageW(nullptr,
-            IDI_HAND, IMAGE_ICON, 16, 16, LR_SHARED);
+            IDI_INFORMATION, IMAGE_ICON, 16, 16, LR_SHARED);
         SendDlgItemMessageW(hDlg, IDC_ICON_ERR, STM_SETICON,
             (WPARAM)errIcon, 0);
         ReloadAdapters(hDlg);
@@ -675,7 +677,7 @@ static INT_PTR CALLBACK AdapterProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp)
             && IsWindowVisible(ctl)) {
             HDC hdc = (HDC)wp;
             SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, RGB(0xA8, 0x2A, 0x1E));
+            SetTextColor(hdc, GetSysColor(COLOR_GRAYTEXT));
             return (INT_PTR)(LONG_PTR)ui->ErrorBrush;
         }
         return FALSE;
